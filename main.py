@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # ENABLE CORS FOR ALL ROUTES
 
 @app.route("/")
 def home():
@@ -15,7 +17,6 @@ def generate():
     music = data.get("music")
     pace = data.get("pace")
 
-    # TEMP RESPONSE: just echo data back
     return jsonify({
         "status": "received",
         "difficulty": difficulty,

@@ -60,7 +60,7 @@ def test_audio():
     This tests downloading a single audio file from Supabase.
     Replace the path with ANY real file in your bucket.
     """
-    test_path = "1-1-2.mp3"   # <-- Replace with ANY real file
+    test_path = "beginner/1-1-2.mp3"   # <-- Replace with ANY real file
 
     url = public_url(test_path)
     print("Attempting:", url)

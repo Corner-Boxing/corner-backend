@@ -4,6 +4,9 @@ import os
 import random
 import tempfile
 import time
+import uuid
+import threading
+from datetime import datetime
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -29,7 +32,7 @@ SUPABASE_KEY = (
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Local audio directory in your repo (matches what you showed: audio/advanced, audio/beginner, etc.)
+# Local audio directory in your repo (audio/...)
 BASE_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
 
 
@@ -57,10 +60,10 @@ def random_audio_path(subdir: str) -> str:
          subdir='tips'     -> 'tips/whatever.mp3'
     """
     dir_path = os.path.join(BASE_AUDIO_DIR, subdir)
-    files = [
-        f for f in os.listdir(dir_path)
-        if f.lower().endswith(".mp3")
-    ]
+    if not os.path.isdir(dir_path):
+        raise RuntimeError(f"Directory not found: {dir_path}")
+
+    files = [f for f in os.listdir(dir_path) if f.lower().endswith(".mp3")]
     if not files:
         raise RuntimeError(f"No mp3 files found in {dir_path}")
     filename = random.choice(files)
@@ -303,7 +306,6 @@ def export_and_upload(master: AudioSegment, difficulty: str, length_min: int, pa
     object_path = f"generated/{filename}"
 
     with open(tmp_path, "rb") as f:
-        # upload to existing 'audio' bucket
         res = supabase.storage.from_("audio").upload(
             object_path,
             f,
@@ -312,9 +314,96 @@ def export_and_upload(master: AudioSegment, difficulty: str, length_min: int, pa
 
     os.remove(tmp_path)
 
-    # Build public URL
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/audio/{object_path}"
     return public_url
+
+
+# ------------------------
+# Simple in-memory job queue
+# ------------------------
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def create_job(plan: dict) -> dict:
+    job_id = uuid.uuid4().hex
+    now = _now_iso()
+    job = {
+        "id": job_id,
+        "status": "queued",      # queued | processing | done | error
+        "created_at": now,
+        "updated_at": now,
+        "plan": plan,
+        "file_url": None,
+        "error": None,
+    }
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    return job
+
+
+def get_next_queued_job() -> dict | None:
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job["status"] == "queued":
+                job["status"] = "processing"
+                job["updated_at"] = _now_iso()
+                return job
+    return None
+
+
+def update_job(job_id: str, **fields) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = _now_iso()
+
+
+def worker_loop():
+    """
+    Background worker that continuously processes queued jobs.
+    Runs in a daemon thread.
+    """
+    print("[WORKER] Background worker started")
+    while True:
+        job = get_next_queued_job()
+        if not job:
+            time.sleep(1.0)
+            continue
+
+        job_id = job["id"]
+        print(f"[WORKER] Processing job {job_id}")
+
+        try:
+            plan = job["plan"]
+            difficulty = plan.get("difficulty", "beginner")
+            length_min = int(plan.get("length_min", 60))
+            pace = plan.get("pace", "Normal")
+
+            master = build_audio_from_plan(plan)
+            file_url = export_and_upload(master, difficulty, length_min, pace)
+
+            update_job(job_id, status="done", file_url=file_url, error=None)
+            print(f"[WORKER] Job {job_id} completed -> {file_url}")
+        except Exception as e:
+            print(f"[WORKER] ERROR in job {job_id}: {repr(e)}")
+            update_job(job_id, status="error", error=str(e))
+
+
+def start_worker():
+    t = threading.Thread(target=worker_loop, daemon=True)
+    t.start()
+
+
+# Start worker when app imports
+start_worker()
 
 
 # ------------------------
@@ -360,6 +449,13 @@ def debug_generate():
 
 @app.route("/generate", methods=["POST"])
 def generate():
+    """
+    NEW behavior:
+    - Build plan
+    - Create job
+    - Return job_id and plan
+    Audio generation happens in the background worker.
+    """
     data = request.get_json() or {}
 
     difficulty = (data.get("difficulty") or "beginner").lower()
@@ -373,23 +469,32 @@ def generate():
     music = data.get("music") or "None"
 
     plan = build_class_plan(difficulty, length_min, pace, music)
+    job = create_job(plan)
 
-    try:
-        master = build_audio_from_plan(plan)
-        file_url = export_and_upload(master, difficulty, length_min, pace)
+    return jsonify({
+        "status": "queued",
+        "job_id": job["id"],
+        "plan": plan
+    }), 202
 
-        return jsonify({
-            "status": "success",
-            "file_url": file_url,
-            "plan": plan
-        })
-    except Exception as e:
-        # log to stdout for Render logs
-        print("ERROR assembling or uploading class:", repr(e))
-        return jsonify({
-            "status": "failed",
-            "message": str(e)
-        }), 500
+
+@app.route("/job-status/<job_id>", methods=["GET"])
+def job_status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+
+    if not job:
+        return jsonify({"status": "not_found", "job_id": job_id}), 404
+
+    return jsonify({
+        "status": job["status"],
+        "job_id": job["id"],
+        "file_url": job["file_url"],
+        "error": job["error"],
+        "plan": job["plan"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+    })
 
 
 if __name__ == "__main__":

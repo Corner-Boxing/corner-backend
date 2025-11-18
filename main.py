@@ -1,4 +1,3 @@
-# main.py  — CLEAN LONG-TERM VERSION
 import os
 import random
 import tempfile
@@ -8,30 +7,41 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
 from pydub import AudioSegment
-import requests
+
+import requests  # still used by /test-audio
+
+
+# ------------------------
+# Flask + Supabase setup
+# ------------------------
 
 app = Flask(__name__)
 CORS(app)
 
-# ------------------------
-# Supabase setup
-# ------------------------
 SUPABASE_URL = "https://lbhmfkmrluoropzfleaa.supabase.co"
 SUPABASE_KEY = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxiaG1m"
     "a21ybHVvcm9wemZsZWFhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzIyMjAyOSwi"
     "ZXhwIjoyMDc4Nzk4MDI5fQ.Bmqu3Y9Woe4JPVO9bNviXN9ePJWc0LeIsItLjUT2mgQ"
 )
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Local audio directory
+# Local audio directory in your repo (audio/...)
 BASE_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
 
 
 # ------------------------
-# Audio file loading helpers
+# Helpers – file loading
 # ------------------------
+
 def load_audio(rel_path: str) -> AudioSegment:
+    """
+    rel_path examples:
+      'intro_outro/intro.mp3'
+      'beginner/1-1-2.mp3'
+      'tips/breathe-between-combos.mp3'
+    """
     full_path = os.path.join(BASE_AUDIO_DIR, rel_path)
     if not os.path.isfile(full_path):
         raise FileNotFoundError(f"Audio file not found: {full_path}")
@@ -39,60 +49,82 @@ def load_audio(rel_path: str) -> AudioSegment:
 
 
 def random_audio_path(subdir: str) -> str:
+    """
+    Returns a random .mp3 inside audio/<subdir>/
+    e.g. subdir='beginner' -> 'beginner/1-1-2.mp3'
+         subdir='tips'     -> 'tips/whatever.mp3'
+    """
     dir_path = os.path.join(BASE_AUDIO_DIR, subdir)
     if not os.path.isdir(dir_path):
-        raise RuntimeError(f"Directory does not exist: {dir_path}")
+        raise RuntimeError(f"Directory not found: {dir_path}")
 
     files = [f for f in os.listdir(dir_path) if f.lower().endswith(".mp3")]
     if not files:
-        raise RuntimeError(f"No .mp3 files found in: {dir_path}")
-
-    return os.path.join(subdir, random.choice(files))
+        raise RuntimeError(f"No mp3 files found in {dir_path}")
+    filename = random.choice(files)
+    return os.path.join(subdir, filename)
 
 
 def overlay(base: AudioSegment, clip: AudioSegment, start_ms: int) -> AudioSegment:
+    """Overlay clip onto base at start_ms, safely."""
     if start_ms < 0:
         start_ms = 0
     if start_ms > len(base):
-        base += AudioSegment.silent(duration=(start_ms - len(base)))
+        # extend with silence if needed
+        base = base + AudioSegment.silent(duration=start_ms - len(base))
     return base.overlay(clip, position=start_ms)
 
 
 # ------------------------
-# Plan generation
+# Class plan generation
 # ------------------------
+
 def compute_num_rounds(length_min: int) -> int:
-    non_round = 11   # warmup+core+cooldown
+    """
+    Each round block = 3 min work + 0.5 min break = 3.5 min
+    Warmup + core + cooldown = 5 + 5 + 1 = 11 min
+    """
+    non_round = 11
     usable = max(0, length_min - non_round)
-    return max(1, int(usable // 3.5))
+    num_rounds = max(1, int(usable // 3.5))
+    return num_rounds
 
 
 def build_round_segment(round_number: int, difficulty: str, pace: str) -> dict:
     duration_sec = 180
     break_duration_sec = 30
 
-    # Combo pacing
-    spacing = 15
+    # Pace affects combo spacing
     if pace.lower() == "fast":
         spacing = 12
     elif pace.lower() == "slow":
         spacing = 18
+    else:
+        spacing = 15  # Normal
 
+    # main combo times
     combo_times = []
     t = 2
     while t < 160:
         combo_times.append(t)
         t += spacing
 
-    events = [{"event_type": "combo", "time_sec": ct, "difficulty": difficulty}
-              for ct in combo_times]
+    events = []
 
-    # Tips/motivation
-    coach_slots = list(range(9, 160, spacing))
-    random.shuffle(coach_slots)
-    coach_slots = coach_slots[:4]
+    for ct in combo_times:
+        events.append({
+            "event_type": "combo",
+            "time_sec": ct,
+            "difficulty": difficulty
+        })
 
-    for ts in coach_slots:
+    # Candidate coach (tip/motivation) slots roughly between combos
+    coach_candidates = list(range(9, 160, spacing))
+    random.shuffle(coach_candidates)
+    coach_candidates = coach_candidates[:4]  # up to 4 per round
+
+    for ts in coach_candidates:
+        # Don’t drop a coach call < 4 sec away from a combo
         if any(abs(ts - c) < 4 for c in combo_times):
             continue
         if random.random() < 0.5:
@@ -100,12 +132,14 @@ def build_round_segment(round_number: int, difficulty: str, pace: str) -> dict:
         else:
             events.append({"event_type": "motivation", "time_sec": ts})
 
+    # Last 10 seconds push
     events.append({
         "event_type": "countdown",
         "time_sec": duration_sec - 10,
         "variant": "last-ten-seconds-push"
     })
 
+    # Break events – 'break-in-3-2-1' at 27s of a 30s break
     break_events = [{
         "event_type": "countdown",
         "time_sec": 27,
@@ -127,17 +161,45 @@ def build_round_segment(round_number: int, difficulty: str, pace: str) -> dict:
 
 def build_class_plan(difficulty: str, length_min: int, pace: str, music: str) -> dict:
     num_rounds = compute_num_rounds(length_min)
+
     segments = []
 
-    segments.append({"type": "intro", "file": "intro_outro/intro.mp3"})
-    segments.append({"type": "warmup", "file": "warmup/warmup.mp3", "duration_sec": 300})
+    # Intro
+    segments.append({
+        "type": "intro",
+        "file": "intro_outro/intro.mp3"
+    })
 
+    # Warmup
+    segments.append({
+        "type": "warmup",
+        "file": "warmup/warmup.mp3",
+        "duration_sec": 300
+    })
+
+    # Rounds
     for r in range(1, num_rounds + 1):
         segments.append(build_round_segment(r, difficulty, pace))
 
-    segments.append({"type": "core", "file": "core/core.mp3", "duration_sec": 300})
-    segments.append({"type": "cooldown", "file": "cooldown/cooldown.mp3", "duration_sec": 60})
-    segments.append({"type": "outro", "file": "intro_outro/outro.mp3"})
+    # Core
+    segments.append({
+        "type": "core",
+        "file": "core/core.mp3",
+        "duration_sec": 300
+    })
+
+    # Cooldown
+    segments.append({
+        "type": "cooldown",
+        "file": "cooldown/cooldown.mp3",
+        "duration_sec": 60
+    })
+
+    # Outro
+    segments.append({
+        "type": "outro",
+        "file": "intro_outro/outro.mp3"
+    })
 
     return {
         "difficulty": difficulty,
@@ -145,68 +207,97 @@ def build_class_plan(difficulty: str, length_min: int, pace: str, music: str) ->
         "music": music,
         "pace": pace,
         "num_rounds": num_rounds,
-        "segments": segments,
+        "segments": segments
     }
 
 
 # ------------------------
-# Audio Assembly
+# Audio assembly from plan
 # ------------------------
+
 def build_audio_from_plan(plan: dict) -> AudioSegment:
     master = AudioSegment.silent(duration=0)
 
     for seg in plan["segments"]:
-        t = seg["type"]
+        stype = seg["type"]
 
-        if t in ("intro", "warmup", "core", "cooldown", "outro"):
-            master += load_audio(seg["file"])
+        if stype in ("intro", "outro", "warmup", "core", "cooldown"):
+            clip = load_audio(seg["file"])
+            master += clip
             continue
 
-        if t == "round":
-            round_ms = (seg["duration_sec"] + seg["break_duration_sec"]) * 1000
-            block = AudioSegment.silent(duration=round_ms)
+        if stype == "round":
+            round_len_total = (seg["duration_sec"] + seg["break_duration_sec"]) * 1000
+            round_block = AudioSegment.silent(duration=round_len_total)
 
-            block = overlay(block, load_audio(seg["start_file"]), 0)
-            block = overlay(block, load_audio(seg["round_callout_file"]), 2000)
+            # Start and callout
+            start_clip = load_audio(seg["start_file"])
+            round_block = overlay(round_block, start_clip, 0)
 
-            end_call_ms = max((seg["duration_sec"] - 4) * 1000, 0)
-            block = overlay(block, load_audio(seg["end_file"]), end_call_ms)
+            callout_clip = load_audio(seg["round_callout_file"])
+            round_block = overlay(round_block, callout_clip, 2000)
 
-            for e in seg["events"]:
-                pos = int(e["time_sec"] * 1000)
-                if e["event_type"] == "combo":
-                    clip = load_audio(random_audio_path(e["difficulty"]))
-                elif e["event_type"] == "tip":
-                    clip = load_audio(random_audio_path("tips"))
-                elif e["event_type"] == "motivation":
-                    clip = load_audio(random_audio_path("motivation"))
-                elif e["event_type"] == "countdown":
-                    if e.get("variant") == "last-ten-seconds-push":
-                        clip = load_audio("countdowns/last-ten-seconds-push.mp3")
+            # End-of-round call
+            end_clip = load_audio(seg["end_file"])
+            end_start_ms = max((seg["duration_sec"] - 4) * 1000, 0)
+            round_block = overlay(round_block, end_clip, end_start_ms)
+
+            # In-round events
+            for e in seg.get("events", []):
+                t_ms = int(e["time_sec"] * 1000)
+                etype = e["event_type"]
+
+                if etype == "combo":
+                    rel_path = random_audio_path(e["difficulty"])
+                    clip = load_audio(rel_path)
+                elif etype == "tip":
+                    rel_path = random_audio_path("tips")
+                    clip = load_audio(rel_path)
+                elif etype == "motivation":
+                    rel_path = random_audio_path("motivation")
+                    clip = load_audio(rel_path)
+                elif etype == "countdown":
+                    variant = e.get("variant", "")
+                    if variant == "last-ten-seconds-push":
+                        rel_path = "countdowns/last-ten-seconds-push.mp3"
                     else:
-                        clip = load_audio("countdowns/5-4-3-2-1.mp3")
+                        rel_path = "countdowns/5-4-3-2-1.mp3"
+                    clip = load_audio(rel_path)
                 else:
                     continue
-                block = overlay(block, clip, pos)
 
-            for be in seg["break_events"]:
-                if be["event_type"] == "countdown":
-                    pos = int((seg["duration_sec"] + be["time_sec"]) * 1000)
-                    clip = load_audio("countdowns/break-in-3-2-1.mp3")
-                    block = overlay(block, clip, pos)
+                round_block = overlay(round_block, clip, t_ms)
 
-            master += block
+            # Break events (after round duration)
+            for be in seg.get("break_events", []):
+                if be["event_type"] != "countdown":
+                    continue
+                variant = be.get("variant", "")
+                if variant == "break-in-3-2-1":
+                    rel_path = "countdowns/break-in-3-2-1.mp3"
+                else:
+                    rel_path = "countdowns/5-4-3-2-1.mp3"
+                clip = load_audio(rel_path)
+                t_ms = int((seg["duration_sec"] + be["time_sec"]) * 1000)
+                round_block = overlay(round_block, clip, t_ms)
+
+            master += round_block
 
     return master
 
 
 def export_and_upload(master: AudioSegment, difficulty: str, length_min: int, pace: str) -> str:
+    """
+    Export final MP3 to /tmp, upload to Supabase 'audio' bucket under generated/,
+    return public URL.
+    """
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         tmp_path = tmp.name
 
     master.export(tmp_path, format="mp3")
 
-    filename = f"class_{difficulty}_{length_min}min_{pace}_{int(time.time())}.mp3"
+    timestamp = int(time.time())
+    filename = f"class_{difficulty}_{length_min}min_{pace}_{timestamp}.mp3"
     object_path = f"generated/{filename}"
 
     with open(tmp_path, "rb") as f:
@@ -218,83 +309,209 @@ def export_and_upload(master: AudioSegment, difficulty: str, length_min: int, pa
 
     os.remove(tmp_path)
 
-    return f"{SUPABASE_URL}/storage/v1/object/public/audio/{object_path}"
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/audio/{object_path}"
+    return public_url
 
 
 # ------------------------
-# REAL Queue System – DB backed
+# Supabase-backed job helpers
 # ------------------------
 
-@app.route("/schedule-job", methods=["POST"])
-def schedule_job():
-    data = request.get_json() or {}
-
-    difficulty = (data.get("difficulty") or "beginner").lower()
-    length = int(data.get("length") or 60)
-    pace = data.get("pace") or "Normal"
-    music = data.get("music") or "None"
-
-    try:
-        result = supabase.table("jobs").insert({
-            "difficulty": difficulty,
-            "length_min": length,
-            "pace": pace,
-            "music": music,
-            "status": "pending"
-        }).execute()
-
-        job = result.data[0]
-        return jsonify({"status": "queued", "job_id": job["id"]})
-
-    except Exception as e:
-        print("ERROR scheduling job:", repr(e))
-        return jsonify({"status": "failed", "message": str(e)}), 500
+def create_job_row(plan: dict, difficulty: str, length_min: int, pace: str, music: str) -> dict:
+    """
+    Insert a new job row into class_jobs and return the inserted row.
+    """
+    payload = {
+        "status": "queued",
+        "difficulty": difficulty,
+        "length_min": length_min,
+        "pace": pace,
+        "music": music,
+        "plan": plan,
+        "file_url": None,
+        "error": None,
+    }
+    res = supabase.table("class_jobs").insert(payload).execute()
+    if not res.data:
+        raise RuntimeError("Failed to insert job row into class_jobs")
+    return res.data[0]
 
 
-@app.route("/process-job/<int:job_id>", methods=["POST"])
-def process_job(job_id):
-    try:
-        result = supabase.table("jobs").select("*").eq("id", job_id).single().execute()
-    except Exception:
-        return jsonify({"status": "error", "message": "Job not found"}), 404
-
-    job = result.data
-
-    if job["status"] not in ("pending", "processing"):
-        return jsonify({"status": "skipped", "message": "Job already processed"})
-
-    # Mark processing
-    supabase.table("jobs").update({"status": "processing"}).eq("id", job_id).execute()
-
-    try:
-        plan = build_class_plan(job["difficulty"], job["length_min"], job["pace"], job["music"])
-        master = build_audio_from_plan(plan)
-        url = export_and_upload(master, job["difficulty"], job["length_min"], job["pace"])
-
-        supabase.table("jobs").update({
-            "status": "done",
-            "file_url": url
-        }).eq("id", job_id).execute()
-
-        return jsonify({"status": "done", "file_url": url})
-
-    except Exception as e:
-        supabase.table("jobs").update({
-            "status": "error",
-            "error": str(e)
-        }).eq("id", job_id).execute()
-
-        return jsonify({"status": "error", "message": str(e)}), 500
+def fetch_job(job_id: str):
+    res = supabase.table("class_jobs").select("*").eq("id", job_id).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
 
 
-@app.route("/job-status/<int:job_id>", methods=["GET"])
-def job_status(job_id):
-    result = supabase.table("jobs").select("*").eq("id", job_id).single().execute()
-    if not result.data:
-        return jsonify({"status": "not_found"}), 404
-    return jsonify(result.data)
+def update_job(job_id: str, fields: dict):
+    res = supabase.table("class_jobs").update(fields).eq("id", job_id).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
 
+
+def fetch_next_queued_job():
+    """
+    Get the oldest queued job (status='queued').
+    """
+    res = (
+        supabase.table("class_jobs")
+        .select("*")
+        .eq("status", "queued")
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return None
+    return rows[0]
+
+
+# ------------------------
+# Routes
+# ------------------------
 
 @app.route("/")
 def home():
     return "Corner Backend Running"
+
+
+@app.route("/test-audio", methods=["GET"])
+def test_audio():
+    # basic sanity check that a file is reachable from Supabase
+    file_path = "audio/beginner/1-1-2.mp3"
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{file_path}"
+
+    r = requests.get(public_url)
+    if r.status_code == 200:
+        return jsonify({
+            "status": "success",
+            "url": public_url,
+            "size_bytes": len(r.content)
+        })
+    else:
+        return jsonify({
+            "status": "failed",
+            "code": r.status_code,
+            "url": public_url
+        }), 400
+
+
+@app.route("/debug-generate", methods=["GET"])
+def debug_generate():
+    difficulty = request.args.get("difficulty", "beginner").lower()
+    length = int(request.args.get("length", "60"))
+    pace = request.args.get("pace", "Normal")
+    music = request.args.get("music", "None")
+
+    plan = build_class_plan(difficulty, length, pace, music)
+    return jsonify(plan)
+
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    """
+    - Build plan
+    - Create job row in Supabase (status='queued')
+    - Return job_id + plan
+    Actual audio generation is done by /process-next.
+    """
+    data = request.get_json() or {}
+
+    difficulty = (data.get("difficulty") or "beginner").lower()
+    length_raw = data.get("length") or 60
+    try:
+        length_min = int(length_raw)
+    except ValueError:
+        length_min = 60
+
+    pace = data.get("pace") or "Normal"
+    music = data.get("music") or "None"
+
+    plan = build_class_plan(difficulty, length_min, pace, music)
+
+    try:
+        job_row = create_job_row(plan, difficulty, length_min, pace, music)
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": f"Failed to create job: {e}"
+        }), 500
+
+    return jsonify({
+        "status": "queued",
+        "job_id": job_row["id"],
+        "plan": job_row["plan"],
+    }), 202
+
+
+@app.route("/job-status/<job_id>", methods=["GET"])
+def job_status(job_id):
+    job = fetch_job(job_id)
+    if not job:
+        return jsonify({"status": "not_found", "job_id": job_id}), 404
+
+    return jsonify({
+        "status": job["status"],
+        "job_id": job["id"],
+        "file_url": job.get("file_url"),
+        "error": job.get("error"),
+        "plan": job.get("plan"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    })
+
+
+@app.route("/process-next", methods=["POST", "GET"])
+def process_next():
+    """
+    Process the next queued job.
+    This endpoint is meant to be called by an external cron service
+    (e.g. cron-job.org) on a schedule.
+    """
+    job = fetch_next_queued_job()
+    if not job:
+        return jsonify({"status": "no_jobs"}), 200
+
+    job_id = job["id"]
+
+    # Mark as processing
+    update_job(job_id, {"status": "processing"})
+
+    try:
+        plan = job["plan"] or {}
+        difficulty = plan.get("difficulty", job.get("difficulty", "beginner"))
+        length_min = int(plan.get("length_min", job.get("length_min", 60)))
+        pace = plan.get("pace", job.get("pace", "Normal"))
+
+        master = build_audio_from_plan(plan)
+        file_url = export_and_upload(master, difficulty, length_min, pace)
+
+        updated = update_job(job_id, {
+            "status": "done",
+            "file_url": file_url,
+            "error": None,
+        })
+
+        return jsonify({
+            "status": "done",
+            "job_id": job_id,
+            "file_url": file_url,
+            "job": updated,
+        })
+    except Exception as e:
+        updated = update_job(job_id, {
+            "status": "error",
+            "error": str(e),
+        })
+        return jsonify({
+            "status": "error",
+            "job_id": job_id,
+            "error": str(e),
+            "job": updated,
+        }), 500
+
+
+if __name__ == "__main__":
+    # For local testing; Render uses gunicorn
+    app.run(host="0.0.0.0", port=10000)

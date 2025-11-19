@@ -85,7 +85,6 @@ def build_round_segment(r, difficulty, pace):
     for ts in coach_candidates:
         if any(abs(ts - c) < 4 for c in combo_times):
             continue
-
         events.append({
             "event_type": random.choice(["tip", "motivation"]),
             "time_sec": ts
@@ -215,15 +214,15 @@ def export_and_upload(master, difficulty, length_min, pace):
 
 
 # -------------------------------------------------
-# Supabase JOB Logic (FINAL & CORRECT)
+# Supabase JOB Logic (FINAL)
 # -------------------------------------------------
 
 def create_db_job(plan):
-    # Insert ONLY the plan. ALL other fields are defaulted by Supabase.
     result = supabase.table("jobs").insert({"plan": plan}).execute()
 
-    if result.status_code >= 300:
-        raise Exception(f"Failed insert: {result}")
+    # NEW API: if error is None → success
+    if result.error:
+        raise Exception(result.error)
 
     return result.data[0]["id"]
 
@@ -242,10 +241,7 @@ def fetch_next_job():
         .execute()
     )
 
-    if not result.data:
-        return None
-
-    return result.data[0]
+    return result.data[0] if result.data else None
 
 
 def worker_loop():
@@ -270,13 +266,12 @@ def worker_loop():
                 plan["length_min"],
                 plan["pace"]
             )
-
             update_db_job(job_id, {"status": "done", "file_url": url})
 
         except Exception as e:
             update_db_job(job_id, {"status": "error", "error": str(e)})
 
-        time.sleep(0.2)
+        time.sleep(0.1)
 
 
 threading.Thread(target=worker_loop, daemon=True).start()

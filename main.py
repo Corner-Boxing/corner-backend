@@ -9,7 +9,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
 from pydub import AudioSegment
-import requests
 
 
 # -------------------------------------------------
@@ -44,7 +43,7 @@ def load_audio(rel_path):
 
 def random_audio_path(folder):
     d = os.path.join(BASE_AUDIO_DIR, folder)
-    files = [f for f in os.listdir(d) if f.endswith(".mp3")]
+    files = [f for f in os.listdir(d) if f.lower().endswith(".mp3")]
     if not files:
         raise Exception(f"No mp3 files in {d}")
     return os.path.join(folder, random.choice(files))
@@ -92,7 +91,7 @@ def build_round_segment(r, difficulty, pace):
 
     events.append({
         "event_type": "countdown",
-        "variant": "last-ten-seconds-push",
+        """variant""": "last-ten-seconds-push",
         "time_sec": duration_sec - 10
     })
 
@@ -214,13 +213,13 @@ def export_and_upload(master, difficulty, length_min, pace):
 
 
 # -------------------------------------------------
-# Supabase JOB Logic (FINAL)
+# Supabase JOB Logic (correct v2 API)
 # -------------------------------------------------
 
 def create_db_job(plan):
     result = supabase.table("jobs").insert({"plan": plan}).execute()
 
-    # NEW API: if error is None → success
+    # Supabase v2: errors appear in result.error, but sometimes it's None + status_code=201
     if result.error:
         raise Exception(result.error)
 
@@ -241,7 +240,9 @@ def fetch_next_job():
         .execute()
     )
 
-    return result.data[0] if result.data else None
+    if not result.data:
+        return None
+    return result.data[0]
 
 
 def worker_loop():
@@ -269,7 +270,10 @@ def worker_loop():
             update_db_job(job_id, {"status": "done", "file_url": url})
 
         except Exception as e:
-            update_db_job(job_id, {"status": "error", "error": str(e)})
+            update_db_job(job_id, {
+                "status": "error",
+                "error": str(e)
+            })
 
         time.sleep(0.1)
 
@@ -286,6 +290,8 @@ def home():
     return "Corner Backend Running"
 
 
+# -------- TEMP DEBUG /generate (shows full errors!) --------
+
 @app.route("/generate", methods=["POST"])
 def generate():
     data = request.get_json() or {}
@@ -297,24 +303,20 @@ def generate():
         data.get("music") or "None"
     )
 
-    # DEBUG WRAPPER — print EXACT supabase response
     try:
         job_id = create_db_job(plan)
         return jsonify({"status": "queued", "job_id": job_id}), 202
 
     except Exception as e:
-        # 🔥 Print full stack trace + type of exception
         import traceback
         traceback.print_exc()
 
-        # 🔥 Return full repr() so we see everything
         return jsonify({
             "status": "error",
             "error_type": type(e).__name__,
             "error_message": str(e),
             "error_repr": repr(e)
         }), 400
-
 
 
 @app.route("/job-status/<job_id>")

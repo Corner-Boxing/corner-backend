@@ -297,11 +297,24 @@ def generate():
         data.get("music") or "None"
     )
 
+    # DEBUG WRAPPER — print EXACT supabase response
     try:
         job_id = create_db_job(plan)
         return jsonify({"status": "queued", "job_id": job_id}), 202
+
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 400
+        # 🔥 Print full stack trace + type of exception
+        import traceback
+        traceback.print_exc()
+
+        # 🔥 Return full repr() so we see everything
+        return jsonify({
+            "status": "error",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "error_repr": repr(e)
+        }), 400
+
 
 
 @app.route("/job-status/<job_id>")

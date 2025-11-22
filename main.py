@@ -308,8 +308,3 @@ def job_status(job_id):
 
     # Just return the row as-is; frontend uses status + file_url + error
     return jsonify(result.data[0])
-
-
-if __name__ == "__main__":
-    # Render start command for this service should be: python main.py
-    app.run(host="0.0.0.0", port=10000)

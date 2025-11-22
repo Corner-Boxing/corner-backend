@@ -3,7 +3,6 @@ import random
 import tempfile
 import time
 import threading
-from datetime import datetime
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -34,37 +33,37 @@ BASE_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
 # Audio Helpers
 # -------------------------------------------------
 
-def load_audio(rel_path):
+def load_audio(rel_path: str) -> AudioSegment:
     path = os.path.join(BASE_AUDIO_DIR, rel_path)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Audio file not found: {path}")
     return AudioSegment.from_file(path)
 
 
-def random_audio_path(folder):
+def random_audio_path(folder: str) -> str:
     d = os.path.join(BASE_AUDIO_DIR, folder)
-    files = [f for f in os.listdir(d) if f.lower().endswith(".mp3")]
+    files = [f for f in os.listdir(d) if f.endswith(".mp3")]
     if not files:
         raise Exception(f"No mp3 files in {d}")
     return os.path.join(folder, random.choice(files))
 
 
-def overlay(base, clip, t):
-    if t > len(base):
-        base += AudioSegment.silent(duration=t - len(base))
-    return base.overlay(clip, position=t)
+def overlay(base: AudioSegment, clip: AudioSegment, t_ms: int) -> AudioSegment:
+    if t_ms > len(base):
+        base += AudioSegment.silent(duration=t_ms - len(base))
+    return base.overlay(clip, position=t_ms)
 
 
 # -------------------------------------------------
 # Class Plan Generation
 # -------------------------------------------------
 
-def compute_num_rounds(length_min):
+def compute_num_rounds(length_min: int) -> int:
     usable = max(0, length_min - 11)
     return max(1, int(usable // 3.5))
 
 
-def build_round_segment(r, difficulty, pace):
+def build_round_segment(r: int, difficulty: str, pace: str) -> dict:
     spacing = {"slow": 18, "fast": 12}.get(pace.lower(), 15)
     duration_sec = 180
 
@@ -74,8 +73,14 @@ def build_round_segment(r, difficulty, pace):
         combo_times.append(t)
         t += spacing
 
-    events = [{"event_type": "combo", "difficulty": difficulty, "time_sec": ct}
-              for ct in combo_times]
+    events = [
+        {
+            "event_type": "combo",
+            "difficulty": difficulty,
+            "time_sec": ct
+        }
+        for ct in combo_times
+    ]
 
     coach_candidates = list(range(9, 160, spacing))
     random.shuffle(coach_candidates)
@@ -86,13 +91,13 @@ def build_round_segment(r, difficulty, pace):
             continue
         events.append({
             "event_type": random.choice(["tip", "motivation"]),
-            "time_sec": ts
+            "time_sec": ts,
         })
 
     events.append({
         "event_type": "countdown",
         "variant": "last-ten-seconds-push",
-        "time_sec": duration_sec - 10
+        "time_sec": duration_sec - 10,
     })
 
     return {
@@ -108,13 +113,13 @@ def build_round_segment(r, difficulty, pace):
             {
                 "event_type": "countdown",
                 "variant": "break-in-3-2-1",
-                "time_sec": 27
+                "time_sec": 27,
             }
-        ]
+        ],
     }
 
 
-def build_class_plan(difficulty, length_min, pace, music):
+def build_class_plan(difficulty: str, length_min: int, pace: str, music: str) -> dict:
     num_rounds = compute_num_rounds(length_min)
 
     segs = [
@@ -128,7 +133,7 @@ def build_class_plan(difficulty, length_min, pace, music):
     segs += [
         {"type": "core", "file": "core/core.mp3", "duration_sec": 300},
         {"type": "cooldown", "file": "cooldown/cooldown.mp3", "duration_sec": 60},
-        {"type": "outro", "file": "intro_outro/outro.mp3"}
+        {"type": "outro", "file": "intro_outro/outro.mp3"},
     ]
 
     return {
@@ -137,7 +142,7 @@ def build_class_plan(difficulty, length_min, pace, music):
         "pace": pace,
         "music": music,
         "num_rounds": num_rounds,
-        "segments": segs
+        "segments": segs,
     }
 
 
@@ -145,7 +150,7 @@ def build_class_plan(difficulty, length_min, pace, music):
 # Audio Assembly
 # -------------------------------------------------
 
-def build_audio_from_plan(plan):
+def build_audio_from_plan(plan: dict) -> AudioSegment:
     master = AudioSegment.silent(duration=0)
 
     for seg in plan["segments"]:
@@ -158,12 +163,15 @@ def build_audio_from_plan(plan):
                 duration=(seg["duration_sec"] + seg["break_duration_sec"]) * 1000
             )
 
+            # start + round callout
             block = overlay(block, load_audio(seg["start_file"]), 0)
             block = overlay(block, load_audio(seg["round_callout_file"]), 2000)
 
+            # round end
             endpos = max((seg["duration_sec"] - 4) * 1000, 0)
             block = overlay(block, load_audio(seg["end_file"]), endpos)
 
+            # events inside round
             for e in seg["events"]:
                 t = e["time_sec"] * 1000
                 if e["event_type"] == "combo":
@@ -181,6 +189,7 @@ def build_audio_from_plan(plan):
                     )
                 block = overlay(block, clip, t)
 
+            # break events
             for be in seg["break_events"]:
                 t = (seg["duration_sec"] + be["time_sec"]) * 1000
                 clip = load_audio("countdowns/break-in-3-2-1.mp3")
@@ -191,7 +200,10 @@ def build_audio_from_plan(plan):
     return master
 
 
-def export_and_upload(master, difficulty, length_min, pace):
+def export_and_upload(master: AudioSegment,
+                      difficulty: str,
+                      length_min: int,
+                      pace: str) -> str:
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         tmp_path = tmp.name
 
@@ -204,7 +216,7 @@ def export_and_upload(master, difficulty, length_min, pace):
         supabase.storage.from_("audio").upload(
             object_path,
             f,
-            {"content-type": "audio/mpeg", "upsert": True}
+            {"content-type": "audio/mpeg", "upsert": True},
         )
 
     os.remove(tmp_path)
@@ -213,24 +225,10 @@ def export_and_upload(master, difficulty, length_min, pace):
 
 
 # -------------------------------------------------
-# Supabase JOB Logic (correct version)
+# Supabase JOB Logic (no big plan in DB)
 # -------------------------------------------------
 
-def create_db_job(plan):
-    """
-    Correct Supabase v2 behavior:
-    - result.error DOES NOT EXIST → remove check
-    - rely on result.data only
-    """
-    result = supabase.table("jobs").insert({"plan": plan}).execute()
-
-    if not result.data:
-        raise Exception(f"Insert failed: status={result.status_code}")
-
-    return result.data[0]["id"]
-
-
-def update_db_job(job_id, fields):
+def update_db_job(job_id, fields: dict):
     supabase.table("jobs").update(fields).eq("id", job_id).execute()
 
 
@@ -247,7 +245,7 @@ def fetch_next_job():
 
 
 def worker_loop():
-    print("[WORKER] Worker running")
+    print("[WORKER] Worker running", flush=True)
 
     while True:
         job = fetch_next_job()
@@ -256,18 +254,21 @@ def worker_loop():
             continue
 
         job_id = job["id"]
-        plan = job["plan"]
+        plan_meta = job.get("plan") or {}
+
+        difficulty = (plan_meta.get("difficulty") or "beginner").lower()
+        length_min = int(plan_meta.get("length_min") or 60)
+        pace = plan_meta.get("pace") or "Normal"
+        music = plan_meta.get("music") or "None"
 
         update_db_job(job_id, {"status": "processing"})
 
         try:
-            audio = build_audio_from_plan(plan)
-            url = export_and_upload(
-                audio,
-                plan["difficulty"],
-                plan["length_min"],
-                plan["pace"]
-            )
+            # REBUILD full class plan here – we no longer rely on DB "segments"
+            full_plan = build_class_plan(difficulty, length_min, pace, music)
+            audio = build_audio_from_plan(full_plan)
+            url = export_and_upload(audio, difficulty, length_min, pace)
+
             update_db_job(job_id, {"status": "done", "file_url": url})
 
         except Exception as e:
@@ -276,6 +277,7 @@ def worker_loop():
         time.sleep(0.1)
 
 
+# start background worker thread
 threading.Thread(target=worker_loop, daemon=True).start()
 
 
@@ -289,29 +291,12 @@ def home():
 
 
 @app.route("/generate", methods=["POST"])
-def generate():
-    data = request.get_json() or {}
-
-    plan = build_class_plan(
-        (data.get("difficulty") or "beginner").lower(),
-        int(data.get("length") or 60),
-        data.get("pace") or "Normal",
-        data.get("music") or "None"
-    )
-
-    try:
-        job_id = create_db_job(plan)
-        return jsonify({"status": "queued", "job_id": job_id}), 202
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "error_message": str(e),
-            "error_type": type(e).__name__,
-            "error_repr": repr(e)
-        }), 400
+def deprecated_generate():
+    # Frontend should NOT call this anymore.
+    return jsonify({
+        "status": "error",
+        "error": "This backend no longer handles /generate. Use the Corner API service.",
+    }), 400
 
 
 @app.route("/job-status/<job_id>")
@@ -321,8 +306,10 @@ def job_status(job_id):
     if not result.data:
         return jsonify({"status": "not_found"}), 404
 
+    # Just return the row as-is; frontend uses status + file_url + error
     return jsonify(result.data[0])
 
 
 if __name__ == "__main__":
+    # Render start command for this service should be: python main.py
     app.run(host="0.0.0.0", port=10000)

@@ -91,7 +91,7 @@ def build_round_segment(r, difficulty, pace):
 
     events.append({
         "event_type": "countdown",
-        """variant""": "last-ten-seconds-push",
+        "variant": "last-ten-seconds-push",
         "time_sec": duration_sec - 10
     })
 
@@ -213,15 +213,19 @@ def export_and_upload(master, difficulty, length_min, pace):
 
 
 # -------------------------------------------------
-# Supabase JOB Logic (correct v2 API)
+# Supabase JOB Logic (correct version)
 # -------------------------------------------------
 
 def create_db_job(plan):
+    """
+    Correct Supabase v2 behavior:
+    - result.error DOES NOT EXIST → remove check
+    - rely on result.data only
+    """
     result = supabase.table("jobs").insert({"plan": plan}).execute()
 
-    # Supabase v2: errors appear in result.error, but sometimes it's None + status_code=201
-    if result.error:
-        raise Exception(result.error)
+    if not result.data:
+        raise Exception(f"Insert failed: status={result.status_code}")
 
     return result.data[0]["id"]
 
@@ -239,10 +243,7 @@ def fetch_next_job():
         .limit(1)
         .execute()
     )
-
-    if not result.data:
-        return None
-    return result.data[0]
+    return result.data[0] if result.data else None
 
 
 def worker_loop():
@@ -270,10 +271,7 @@ def worker_loop():
             update_db_job(job_id, {"status": "done", "file_url": url})
 
         except Exception as e:
-            update_db_job(job_id, {
-                "status": "error",
-                "error": str(e)
-            })
+            update_db_job(job_id, {"status": "error", "error": str(e)})
 
         time.sleep(0.1)
 
@@ -289,8 +287,6 @@ threading.Thread(target=worker_loop, daemon=True).start()
 def home():
     return "Corner Backend Running"
 
-
-# -------- TEMP DEBUG /generate (shows full errors!) --------
 
 @app.route("/generate", methods=["POST"])
 def generate():
@@ -310,11 +306,10 @@ def generate():
     except Exception as e:
         import traceback
         traceback.print_exc()
-
         return jsonify({
             "status": "error",
-            "error_type": type(e).__name__,
             "error_message": str(e),
+            "error_type": type(e).__name__,
             "error_repr": repr(e)
         }), 400
 

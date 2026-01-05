@@ -240,7 +240,6 @@ def fetch_next_job():
         .limit(1)
         .execute()
     )
-    result = supabase.table("jobs").select("id,status,file_url,error,is_public").eq("id", job_id).limit(1).execute()
     return result.data[0] if result.data else None
     
 

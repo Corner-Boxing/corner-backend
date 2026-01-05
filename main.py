@@ -231,14 +231,7 @@ def update_db_job(job_id, fields: dict):
 
 
 def fetch_next_job():
-    result = (
-        supabase.table("jobs")
-        .select("*")
-        .eq("status", "queued")
-        .order("created_at", desc=False)
-        .limit(1)
-        .execute()
-    )
+    result = supabase.table("jobs").select("id,status,file_url,error,is_public").eq("id", job_id).limit(1).execute()
     return result.data[0] if result.data else None
 
 

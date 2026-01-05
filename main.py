@@ -299,9 +299,12 @@ def deprecated_generate():
 
 @app.route("/job-status/<job_id>")
 def job_status(job_id):
+    auth = request.headers.get("Authorization")
+
+    # Fetch job row
     result = (
         supabase.table("jobs")
-        .select("id,status,file_url,error,is_public")
+        .select("id,status,file_url,error,is_public,user_id")
         .eq("id", job_id)
         .limit(1)
         .execute()
@@ -310,13 +313,39 @@ def job_status(job_id):
     if not result.data:
         return jsonify({"status": "not_found"}), 404
 
-    row = result.data[0]
+    job = result.data[0]
+
+    # Public jobs are always readable
+    if job.get("is_public"):
+        return jsonify({
+            "job_id": job["id"],
+            "status": job["status"],
+            "file_url": job["file_url"],
+            "error": job["error"],
+            "is_public": True,
+        })
+
+    # Private job → require auth
+    if not auth or not auth.lower().startswith("bearer "):
+        return jsonify({"status": "error", "error": "Unauthorized"}), 401
+
+    token = auth.split(" ", 1)[1].strip()
+
+    # Validate token + match user
+    try:
+        user_res = supabase.auth.get_user(token)
+        user = getattr(user_res, "user", None)
+        if not user or user.id != job.get("user_id"):
+            return jsonify({"status": "error", "error": "Forbidden"}), 403
+    except Exception:
+        return jsonify({"status": "error", "error": "Unauthorized"}), 401
+
     return jsonify({
-        "job_id": row.get("id"),
-        "status": row.get("status"),
-        "file_url": row.get("file_url"),
-        "error": row.get("error"),
-        "is_public": row.get("is_public", False),
+        "job_id": job["id"],
+        "status": job["status"],
+        "file_url": job["file_url"],
+        "error": job["error"],
+        "is_public": False,
     })
 
 @app.route("/signed-url/<job_id>", methods=["GET"])

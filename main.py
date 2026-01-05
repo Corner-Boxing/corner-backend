@@ -361,3 +361,36 @@ def job_status(job_id):
             "error": "Internal server error",
             "details": str(e),
         }), 500
+
+@app.route("/signed-url/<job_id>", methods=["GET"])
+def signed_url(job_id):
+    # 1) Require auth
+    auth = request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        return jsonify({"status":"error","error":"Unauthorized"}), 401
+
+    token = auth.split(" ", 1)[1].strip()
+    claims = jwt_claims(token)
+    user_id = claims.get("sub")
+    if not user_id:
+        return jsonify({"status":"error","error":"Unauthorized"}), 401
+
+    # 2) Find the class session (or job record) and confirm ownership
+    sess = supabase.table("class_sessions").select("user_id, storage_path, job_id").eq("job_id", job_id).limit(1).execute()
+    if not sess.data:
+        return jsonify({"status":"error","error":"Not found"}), 404
+
+    row = sess.data[0]
+    if row.get("user_id") != user_id:
+        return jsonify({"status":"error","error":"Forbidden"}), 403
+
+    storage_path = row.get("storage_path") or f"classes/{job_id}.mp3"
+
+    # 3) Create a signed URL (expires in 10 minutes)
+    signed = supabase.storage.from_("audio").create_signed_url(storage_path, 60 * 10)
+
+    # supabase-py returns dict-like
+    if not signed or not signed.get("signedURL"):
+        return jsonify({"status":"error","error":"Could not sign url","details": signed}), 500
+
+    return jsonify({"status":"ok","url": signed["signedURL"]})

@@ -230,10 +230,19 @@ def update_db_job(job_id, fields: dict):
     supabase.table("jobs").update(fields).eq("id", job_id).execute()
 
 
+
 def fetch_next_job():
+    result = (
+        supabase.table("jobs")
+        .select("*")
+        .eq("status", "queued")
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
     result = supabase.table("jobs").select("id,status,file_url,error,is_public").eq("id", job_id).limit(1).execute()
     return result.data[0] if result.data else None
-
+    
 
 def worker_loop():
     print("[WORKER] Worker running", flush=True)
@@ -289,71 +298,27 @@ def deprecated_generate():
         "error": "This backend no longer handles /generate. Use the Corner API service.",
     }), 400
 
-@app.route("/job-status/<job_id>", methods=["GET"])
+@app.route("/job-status/<job_id>")
 def job_status(job_id):
-    """
-    Auth-gated status endpoint.
+    result = (
+        supabase.table("jobs")
+        .select("id,status,file_url,error,is_public")
+        .eq("id", job_id)
+        .limit(1)
+        .execute()
+    )
 
-    Rules:
-      - If class_sessions.is_public == True: allow anyone.
-      - Otherwise: require Authorization: Bearer <JWT>
-        and class_sessions.user_id must match the token user.
-    """
-    try:
-        # 1) Read session row (ownership + public flag live here)
-        sess_res = (
-            supabase
-            .table("class_sessions")
-            .select("job_id,user_id,status,file_url,error,is_public")
-            .eq("job_id", job_id)
-            .limit(1)
-            .execute()
-        )
+    if not result.data:
+        return jsonify({"status": "not_found"}), 404
 
-        sess = (getattr(sess_res, "data", None) or [None])[0]
-        if not sess:
-            return jsonify({"status": "error", "error": "Not found"}), 404
-
-        is_public = bool(sess.get("is_public"))
-
-        # 2) If private, require valid auth + ownership
-        if not is_public:
-            auth = request.headers.get("Authorization") or ""
-            if not auth.lower().startswith("bearer "):
-                return jsonify({"status": "error", "error": "Unauthorized"}), 401
-
-            token = auth.split(" ", 1)[1].strip()
-            if not token:
-                return jsonify({"status": "error", "error": "Unauthorized"}), 401
-
-            try:
-                user_res = supabase.auth.get_user(token)
-                user_obj = getattr(user_res, "user", None) or getattr(getattr(user_res, "data", None), "user", None)
-                authed_user_id = getattr(user_obj, "id", None) if user_obj else None
-            except Exception:
-                authed_user_id = None
-
-            if not authed_user_id:
-                return jsonify({"status": "error", "error": "Unauthorized"}), 401
-
-            if str(sess.get("user_id") or "") != str(authed_user_id):
-                return jsonify({"status": "error", "error": "Forbidden"}), 403
-
-        # 3) Return minimal, stable payload
-        return jsonify({
-            "job_id": str(job_id),
-            "status": sess.get("status"),
-            "file_url": sess.get("file_url"),
-            "error": sess.get("error"),
-            "is_public": is_public,
-        }), 200
-
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": "Internal server error",
-            "details": str(e),
-        }), 500
+    row = result.data[0]
+    return jsonify({
+        "job_id": row.get("id"),
+        "status": row.get("status"),
+        "file_url": row.get("file_url"),
+        "error": row.get("error"),
+        "is_public": row.get("is_public", False),
+    })
 
 @app.route("/signed-url/<job_id>", methods=["GET"])
 def signed_url(job_id):

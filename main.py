@@ -3,6 +3,7 @@ import random
 import tempfile
 import time
 import threading
+import jwt
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -25,7 +26,6 @@ SUPABASE_KEY = (
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BASE_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
-
 
 # -------------------------------------------------
 # Audio Helpers
@@ -279,6 +279,31 @@ def worker_loop():
 # start background worker thread
 threading.Thread(target=worker_loop, daemon=True).start()
 
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+
+def get_user_id_from_bearer():
+    auth = request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        return None
+
+    token = auth.split(" ", 1)[1].strip()
+    if not token:
+        return None
+
+    # If you forgot to set the env var, fail closed
+    if not SUPABASE_JWT_SECRET:
+        return None
+
+    try:
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        return payload.get("sub")  # Supabase user id
+    except Exception:
+        return None
 
 # -------------------------------------------------
 # Routes
@@ -299,54 +324,53 @@ def deprecated_generate():
 
 @app.route("/job-status/<job_id>")
 def job_status(job_id):
-    auth = request.headers.get("Authorization")
+    try:
+        # Fetch job row
+        result = (
+            supabase.table("jobs")
+            .select("id,status,file_url,error,is_public,user_id")
+            .eq("id", job_id)
+            .limit(1)
+            .execute()
+        )
 
-    # Fetch job row
-    result = (
-        supabase.table("jobs")
-        .select("id,status,file_url,error,is_public,user_id")
-        .eq("id", job_id)
-        .limit(1)
-        .execute()
-    )
+        if not result.data:
+            return jsonify({"status": "not_found"}), 404
 
-    if not result.data:
-        return jsonify({"status": "not_found"}), 404
+        job = result.data[0]
 
-    job = result.data[0]
+        # Public jobs are always readable
+        if job.get("is_public"):
+            return jsonify({
+                "job_id": job["id"],
+                "status": job["status"],
+                "file_url": job["file_url"],
+                "error": job["error"],
+                "is_public": True,
+            }), 200
 
-    # Public jobs are always readable
-    if job.get("is_public"):
+        # Private job → require auth (FAST local JWT verify)
+        uid = get_user_id_from_bearer()
+        if not uid:
+            return jsonify({"status": "error", "error": "Unauthorized"}), 401
+
+        if uid != job.get("user_id"):
+            return jsonify({"status": "error", "error": "Forbidden"}), 403
+
         return jsonify({
             "job_id": job["id"],
             "status": job["status"],
             "file_url": job["file_url"],
             "error": job["error"],
-            "is_public": True,
-        })
+            "is_public": False,
+        }), 200
 
-    # Private job → require auth
-    if not auth or not auth.lower().startswith("bearer "):
-        return jsonify({"status": "error", "error": "Unauthorized"}), 401
-
-    token = auth.split(" ", 1)[1].strip()
-
-    # Validate token + match user
-    try:
-        user_res = supabase.auth.get_user(token)
-        user = getattr(user_res, "user", None)
-        if not user or user.id != job.get("user_id"):
-            return jsonify({"status": "error", "error": "Forbidden"}), 403
-    except Exception:
-        return jsonify({"status": "error", "error": "Unauthorized"}), 401
-
-    return jsonify({
-        "job_id": job["id"],
-        "status": job["status"],
-        "file_url": job["file_url"],
-        "error": job["error"],
-        "is_public": False,
-    })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Internal server error",
+            "details": str(e),
+        }), 500
 
 @app.route("/signed-url/<job_id>", methods=["GET"])
 def signed_url(job_id):

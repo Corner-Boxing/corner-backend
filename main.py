@@ -27,6 +27,24 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BASE_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
 
+# DEBUGGER
+import sys, codecs, encodings
+
+@app.route("/_debug_codecs")
+def _debug_codecs():
+    out = {
+        "python": sys.version,
+        "encodings_file": getattr(encodings, "__file__", None),
+        "sys_path_first_10": sys.path[:10],
+    }
+    try:
+        codecs.lookup("idna")
+        out["idna_codec"] = "OK"
+    except Exception as e:
+        out["idna_codec"] = f"FAIL: {repr(e)}"
+    return jsonify(out)
+
+
 # -------------------------------------------------
 # Audio Helpers
 # -------------------------------------------------

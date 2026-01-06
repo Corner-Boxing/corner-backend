@@ -50,25 +50,31 @@ def _debug_codecs():
 
 @app.route("/_debug_idna")
 def _debug_idna():
-    enc_dir = os.path.dirname(encodings.__file__)
+    import sys
+    import os
+    import traceback
+    import codecs
+    import encodings as enc_mod
+
+    enc_dir = os.path.dirname(enc_mod.__file__)
     idna_path = os.path.join(enc_dir, "idna.py")
 
     out = {
-        "python": __import__("sys").version,
+        "python": sys.version,
         "encodings_dir": enc_dir,
+        "encodings_file": enc_mod.__file__,
         "idna_py_exists": os.path.exists(idna_path),
         "idna_py_path": idna_path,
     }
 
     try:
-        import encodings.idna  # noqa
+        __import__("encodings.idna")
         out["import_encodings_idna"] = "OK"
     except Exception as e:
         out["import_encodings_idna"] = f"FAIL: {repr(e)}"
-        out["traceback"] = traceback.format_exc()
+        out["traceback_import"] = traceback.format_exc()
 
     try:
-        import codecs
         codecs.lookup("idna")
         out["codecs_lookup_idna"] = "OK"
     except Exception as e:

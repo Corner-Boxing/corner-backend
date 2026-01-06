@@ -4,6 +4,10 @@ import tempfile
 import time
 import threading
 import jwt
+# Debug stuff
+import traceback
+import os
+import encodings
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -42,6 +46,35 @@ def _debug_codecs():
         out["idna_codec"] = "OK"
     except Exception as e:
         out["idna_codec"] = f"FAIL: {repr(e)}"
+    return jsonify(out)
+
+@app.route("/_debug_idna")
+def _debug_idna():
+    enc_dir = os.path.dirname(encodings.__file__)
+    idna_path = os.path.join(enc_dir, "idna.py")
+
+    out = {
+        "python": __import__("sys").version,
+        "encodings_dir": enc_dir,
+        "idna_py_exists": os.path.exists(idna_path),
+        "idna_py_path": idna_path,
+    }
+
+    try:
+        import encodings.idna  # noqa
+        out["import_encodings_idna"] = "OK"
+    except Exception as e:
+        out["import_encodings_idna"] = f"FAIL: {repr(e)}"
+        out["traceback"] = traceback.format_exc()
+
+    try:
+        import codecs
+        codecs.lookup("idna")
+        out["codecs_lookup_idna"] = "OK"
+    except Exception as e:
+        out["codecs_lookup_idna"] = f"FAIL: {repr(e)}"
+        out["traceback_lookup"] = traceback.format_exc()
+
     return jsonify(out)
 
 

@@ -1,7 +1,6 @@
 import os
 import base64
 import json
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
@@ -24,7 +23,7 @@ CORS(
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://lbhmfkmrluoropzfleaa.supabase.co"
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # REQUIRED on Render
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")    # REQUIRED for fast JWT verify (private jobs)
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")    # REQUIRED for fast JWT verify (private sessions)
 
 if not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing SUPABASE_SERVICE_KEY env var on Render for corner-backend.")
@@ -34,21 +33,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 # -------------------------------------------------
 # Helpers
 # -------------------------------------------------
-
-def jwt_claims_no_verify(token: str) -> dict:
-    """
-    Decode JWT payload WITHOUT verifying signature.
-    Only used if you want a quick look at claims (non-security).
-    """
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return {}
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
-        return json.loads(payload)
-    except Exception:
-        return {}
 
 def get_bearer_token() -> str | None:
     auth = request.headers.get("Authorization") or ""
@@ -67,7 +51,6 @@ def get_user_id_from_bearer_fast() -> str | None:
         return None
 
     if not SUPABASE_JWT_SECRET:
-        # Fail closed: if you didn't set the secret, treat as unauthorized
         return None
 
     try:
@@ -83,10 +66,6 @@ def get_user_id_from_bearer_fast() -> str | None:
         return None
 
 def safe_job_response(job: dict, is_public: bool):
-    """
-    Only return the minimal fields frontend needs.
-    (Avoid returning plan, storage_path, etc.)
-    """
     return {
         "job_id": job.get("id"),
         "status": job.get("status"),
@@ -105,7 +84,6 @@ def home():
 
 @app.route("/generate", methods=["POST"])
 def deprecated_generate():
-    # Frontend should NOT call this anymore.
     return jsonify({
         "status": "error",
         "error": "This service does not handle /generate. Use the Corner API service.",
@@ -114,25 +92,30 @@ def deprecated_generate():
 @app.route("/job-status/<job_id>", methods=["GET"])
 def job_status(job_id):
     """
-    Public jobs: readable by anyone.
-    Private jobs: require Bearer JWT and must match jobs.user_id.
+    Source of truth:
+      - jobs: status/file_url/error
+      - class_sessions: is_public + user_id (ownership)
+
+    Public sessions -> readable by anyone.
+    Private sessions -> require Bearer JWT and must match class_sessions.user_id.
+    Guest sessions with is_public=false will be 401 (expected until you flip them to public).
     """
     try:
-        result = (
+        # 1) Fetch job from jobs table (ONLY columns that actually exist)
+        job_res = (
             supabase.table("jobs")
-            .select("id,status,file_url,error,user_id")
+            .select("id,status,file_url,error")
             .eq("id", job_id)
             .limit(1)
             .execute()
         )
 
-        if not result.data:
+        if not job_res.data:
             return jsonify({"status": "not_found"}), 404
 
-        job = result.data[0]
-        is_public = bool(job.get("is_public"))
+        job = job_res.data[0]
 
-        # Look up session visibility (is_public lives on class_sessions, not jobs)
+        # 2) Fetch session visibility + owner from class_sessions
         sess_res = (
             supabase.table("class_sessions")
             .select("is_public,user_id")
@@ -140,31 +123,29 @@ def job_status(job_id):
             .limit(1)
             .execute()
         )
+        sess = sess_res.data[0] if sess_res.data else None
 
-        sess = sess_res.data[0] if sess_res.data else {}
+        # If there's no class_sessions row (edge case), default to public READ of status only.
+        # (This avoids breaking older jobs and prevents 500 spam.)
+        if not sess:
+            return jsonify(safe_job_response(job, True)), 200
+
         is_public = bool(sess.get("is_public"))
-        owner_id = sess.get("user_id")  # session owner (may be null for guests)
+        owner_id = sess.get("user_id")  # may be null for guests
 
-
-        # Public sessions are always readable
+        # 3) Public sessions are always readable
         if is_public:
-            return jsonify({
-                "job_id": job["id"],
-                "status": job["status"],
-                "file_url": job["file_url"],
-                "error": job["error"],
-                "is_public": True,
-            }), 200
+            return jsonify(safe_job_response(job, True)), 200
 
-
-        # Private session → require auth
-        uid = get_user_id_from_bearer()
+        # 4) Private session -> require auth and ownership
+        uid = get_user_id_from_bearer_fast()
         if not uid:
             return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
-        if uid != owner_id:
+        if not owner_id or uid != owner_id:
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
+        return jsonify(safe_job_response(job, False)), 200
 
     except Exception as e:
         return jsonify({
@@ -177,7 +158,7 @@ def job_status(job_id):
 def signed_url(job_id):
     """
     Returns a short-lived signed URL for the audio file.
-    Requires auth and ownership (via class_sessions.user_id).
+    Requires auth + ownership via class_sessions.user_id.
     """
     try:
         uid = get_user_id_from_bearer_fast()
@@ -203,7 +184,6 @@ def signed_url(job_id):
 
         signed = supabase.storage.from_("audio").create_signed_url(storage_path, 60 * 10)
 
-        # supabase-py returns dict-like
         if not signed or not signed.get("signedURL"):
             return jsonify({"status": "error", "error": "Could not sign url", "details": signed}), 500
 
@@ -216,7 +196,6 @@ def signed_url(job_id):
             "details": str(e),
         }), 500
 
-# Optional quick sanity endpoint (keeps you from re-opening the idna rabbit hole)
 @app.route("/_health")
 def _health():
     return jsonify({

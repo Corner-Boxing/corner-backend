@@ -120,7 +120,7 @@ def job_status(job_id):
     try:
         result = (
             supabase.table("jobs")
-            .select("id,status,file_url,error,is_public,user_id")
+            .select("id,status,file_url,error,user_id")
             .eq("id", job_id)
             .limit(1)
             .execute()
@@ -132,19 +132,39 @@ def job_status(job_id):
         job = result.data[0]
         is_public = bool(job.get("is_public"))
 
-        # Public jobs: always readable
-        if is_public:
-            return jsonify(safe_job_response(job, True)), 200
+        # Look up session visibility (is_public lives on class_sessions, not jobs)
+        sess_res = (
+            supabase.table("class_sessions")
+            .select("is_public,user_id")
+            .eq("job_id", job_id)
+            .limit(1)
+            .execute()
+        )
 
-        # Private jobs: require auth + ownership
-        uid = get_user_id_from_bearer_fast()
+        sess = sess_res.data[0] if sess_res.data else {}
+        is_public = bool(sess.get("is_public"))
+        owner_id = sess.get("user_id")  # session owner (may be null for guests)
+
+
+        # Public sessions are always readable
+        if is_public:
+            return jsonify({
+                "job_id": job["id"],
+                "status": job["status"],
+                "file_url": job["file_url"],
+                "error": job["error"],
+                "is_public": True,
+            }), 200
+
+
+        # Private session → require auth
+        uid = get_user_id_from_bearer()
         if not uid:
             return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
-        if uid != job.get("user_id"):
+        if uid != owner_id:
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
-        return jsonify(safe_job_response(job, False)), 200
 
     except Exception as e:
         return jsonify({

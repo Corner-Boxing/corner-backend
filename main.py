@@ -1,366 +1,99 @@
 import os
-import random
-import tempfile
-import time
-import threading
-import jwt
-# Debug stuff
-import traceback
-import os
-import encodings
+import base64
+import json
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
-from pydub import AudioSegment
-
 
 # -------------------------------------------------
-# Flask + Supabase
+# Flask + CORS
 # -------------------------------------------------
 
 app = Flask(__name__)
-CORS(app)
-
-SUPABASE_URL = "https://lbhmfkmrluoropzfleaa.supabase.co"
-SUPABASE_KEY = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxiaG1ma21ybHVvcm9wemZsZWFhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzIyMjAyOSwiZXhwIjoyMDc4Nzk4MDI5fQ.Bmqu3Y9Woe4JPVO9bNviXN9ePJWc0LeIsItLjUT2mgQ"
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "OPTIONS"],
 )
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# -------------------------------------------------
+# Supabase
+# -------------------------------------------------
 
-BASE_AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
+SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://lbhmfkmrluoropzfleaa.supabase.co"
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # REQUIRED on Render
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")    # REQUIRED for fast JWT verify (private jobs)
 
-# DEBUGGER
-import sys, codecs, encodings
+if not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Missing SUPABASE_SERVICE_KEY env var on Render for corner-backend.")
 
-@app.route("/_debug_codecs")
-def _debug_codecs():
-    out = {
-        "python": sys.version,
-        "encodings_file": getattr(encodings, "__file__", None),
-        "sys_path_first_10": sys.path[:10],
-    }
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+
+def jwt_claims_no_verify(token: str) -> dict:
+    """
+    Decode JWT payload WITHOUT verifying signature.
+    Only used if you want a quick look at claims (non-security).
+    """
     try:
-        codecs.lookup("idna")
-        out["idna_codec"] = "OK"
-    except Exception as e:
-        out["idna_codec"] = f"FAIL: {repr(e)}"
-    return jsonify(out)
-
-@app.route("/_debug_idna")
-def _debug_idna():
-    import sys
-    import os
-    import traceback
-    import codecs
-    import encodings as enc_mod
-
-    enc_dir = os.path.dirname(enc_mod.__file__)
-    idna_path = os.path.join(enc_dir, "idna.py")
-
-    out = {
-        "python": sys.version,
-        "encodings_dir": enc_dir,
-        "encodings_file": enc_mod.__file__,
-        "idna_py_exists": os.path.exists(idna_path),
-        "idna_py_path": idna_path,
-    }
-
-    try:
-        __import__("encodings.idna")
-        out["import_encodings_idna"] = "OK"
-    except Exception as e:
-        out["import_encodings_idna"] = f"FAIL: {repr(e)}"
-        out["traceback_import"] = traceback.format_exc()
-
-    try:
-        codecs.lookup("idna")
-        out["codecs_lookup_idna"] = "OK"
-    except Exception as e:
-        out["codecs_lookup_idna"] = f"FAIL: {repr(e)}"
-        out["traceback_lookup"] = traceback.format_exc()
-
-    return jsonify(out)
-
-
-# -------------------------------------------------
-# Audio Helpers
-# -------------------------------------------------
-
-def load_audio(rel_path: str) -> AudioSegment:
-    path = os.path.join(BASE_AUDIO_DIR, rel_path)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Audio file not found: {path}")
-    return AudioSegment.from_file(path)
-
-
-def random_audio_path(folder: str) -> str:
-    d = os.path.join(BASE_AUDIO_DIR, folder)
-    files = [f for f in os.listdir(d) if f.endswith(".mp3")]
-    if not files:
-        raise Exception(f"No mp3 files in {d}")
-    return os.path.join(folder, random.choice(files))
-
-
-def overlay(base: AudioSegment, clip: AudioSegment, t_ms: int) -> AudioSegment:
-    if t_ms > len(base):
-        base += AudioSegment.silent(duration=t_ms - len(base))
-    return base.overlay(clip, position=t_ms)
-
-
-# -------------------------------------------------
-# Class Plan Generation
-# -------------------------------------------------
-
-def compute_num_rounds(length_min: int) -> int:
-    usable = max(0, length_min - 11)
-    return max(1, int(usable // 3.5))
-
-
-def build_round_segment(r: int, difficulty: str, pace: str) -> dict:
-    spacing = {"slow": 18, "fast": 12}.get(pace.lower(), 15)
-    duration_sec = 180
-
-    combo_times = []
-    t = 2
-    while t < 160:
-        combo_times.append(t)
-        t += spacing
-
-    events = [
-        {
-            "event_type": "combo",
-            "difficulty": difficulty,
-            "time_sec": ct
-        }
-        for ct in combo_times
-    ]
-
-    coach_candidates = list(range(9, 160, spacing))
-    random.shuffle(coach_candidates)
-    coach_candidates = coach_candidates[:4]
-
-    for ts in coach_candidates:
-        if any(abs(ts - c) < 4 for c in combo_times):
-            continue
-        events.append({
-            "event_type": random.choice(["tip", "motivation"]),
-            "time_sec": ts,
-        })
-
-    events.append({
-        "event_type": "countdown",
-        "variant": "last-ten-seconds-push",
-        "time_sec": duration_sec - 10,
-    })
-
-    return {
-        "type": "round",
-        "round_number": r,
-        "duration_sec": duration_sec,
-        "break_duration_sec": 30,
-        "start_file": "round_start_end/get-ready-round-starting.mp3",
-        "round_callout_file": f"rounds/round-{r}.mp3",
-        "end_file": "round_start_end/time-recover-and-breathe.mp3",
-        "events": sorted(events, key=lambda e: e["time_sec"]),
-        "break_events": [
-            {
-                "event_type": "countdown",
-                "variant": "break-in-3-2-1",
-                "time_sec": 27,
-            }
-        ],
-    }
-
-
-def build_class_plan(difficulty: str, length_min: int, pace: str, music: str) -> dict:
-    num_rounds = compute_num_rounds(length_min)
-
-    segs = [
-        {"type": "intro", "file": "intro_outro/intro.mp3"},
-        {"type": "warmup", "file": "warmup/warmup.mp3", "duration_sec": 300},
-    ]
-
-    for r in range(1, num_rounds + 1):
-        segs.append(build_round_segment(r, difficulty, pace))
-
-    segs += [
-        {"type": "core", "file": "core/core.mp3", "duration_sec": 300},
-        {"type": "cooldown", "file": "cooldown/cooldown.mp3", "duration_sec": 60},
-        {"type": "outro", "file": "intro_outro/outro.mp3"},
-    ]
-
-    return {
-        "difficulty": difficulty,
-        "length_min": length_min,
-        "pace": pace,
-        "music": music,
-        "num_rounds": num_rounds,
-        "segments": segs,
-    }
-
-
-# -------------------------------------------------
-# Audio Assembly
-# -------------------------------------------------
-
-def build_audio_from_plan(plan: dict) -> AudioSegment:
-    master = AudioSegment.silent(duration=0)
-
-    for seg in plan["segments"]:
-        if seg["type"] in ("intro", "outro", "warmup", "core", "cooldown"):
-            master += load_audio(seg["file"])
-            continue
-
-        if seg["type"] == "round":
-            block = AudioSegment.silent(
-                duration=(seg["duration_sec"] + seg["break_duration_sec"]) * 1000
-            )
-
-            # start + round callout
-            block = overlay(block, load_audio(seg["start_file"]), 0)
-            block = overlay(block, load_audio(seg["round_callout_file"]), 2000)
-
-            # round end
-            endpos = max((seg["duration_sec"] - 4) * 1000, 0)
-            block = overlay(block, load_audio(seg["end_file"]), endpos)
-
-            # events inside round
-            for e in seg["events"]:
-                t = e["time_sec"] * 1000
-                if e["event_type"] == "combo":
-                    clip = load_audio(random_audio_path(e["difficulty"]))
-                elif e["event_type"] == "tip":
-                    clip = load_audio(random_audio_path("tips"))
-                elif e["event_type"] == "motivation":
-                    clip = load_audio(random_audio_path("motivation"))
-                else:
-                    variant = e.get("variant", "")
-                    clip = load_audio(
-                        "countdowns/last-ten-seconds-push.mp3"
-                        if variant == "last-ten-seconds-push"
-                        else "countdowns/5-4-3-2-1.mp3"
-                    )
-                block = overlay(block, clip, t)
-
-            # break events
-            for be in seg["break_events"]:
-                t = (seg["duration_sec"] + be["time_sec"]) * 1000
-                clip = load_audio("countdowns/break-in-3-2-1.mp3")
-                block = overlay(block, clip, t)
-
-            master += block
-
-    return master
-
-
-def export_and_upload(master: AudioSegment,
-                      difficulty: str,
-                      length_min: int,
-                      pace: str) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    master.export(tmp_path, format="mp3")
-
-    fname = f"class_{difficulty}_{length_min}min_{pace}_{int(time.time())}.mp3"
-    object_path = f"generated/{fname}"
-
-    with open(tmp_path, "rb") as f:
-        supabase.storage.from_("audio").upload(
-            object_path,
-            f,
-            {"content-type": "audio/mpeg", "upsert": True},
-        )
-
-    os.remove(tmp_path)
-
-    return f"{SUPABASE_URL}/storage/v1/object/public/audio/{object_path}"
-
-
-# -------------------------------------------------
-# Supabase JOB Logic (no big plan in DB)
-# -------------------------------------------------
-
-def update_db_job(job_id, fields: dict):
-    supabase.table("jobs").update(fields).eq("id", job_id).execute()
-
-
-
-def fetch_next_job():
-    result = (
-        supabase.table("jobs")
-        .select("*")
-        .eq("status", "queued")
-        .order("created_at", desc=False)
-        .limit(1)
-        .execute()
-    )
-    return result.data[0] if result.data else None
-    
-
-def worker_loop():
-    print("[WORKER] Worker running", flush=True)
-
-    while True:
-        job = fetch_next_job()
-        if not job:
-            time.sleep(1)
-            continue
-
-        job_id = job["id"]
-        plan_meta = job.get("plan") or {}
-
-        difficulty = (plan_meta.get("difficulty") or "beginner").lower()
-        length_min = int(plan_meta.get("length_min") or 60)
-        pace = plan_meta.get("pace") or "Normal"
-        music = plan_meta.get("music") or "None"
-
-        update_db_job(job_id, {"status": "processing"})
-
-        try:
-            # REBUILD full class plan here – we no longer rely on DB "segments"
-            full_plan = build_class_plan(difficulty, length_min, pace, music)
-            audio = build_audio_from_plan(full_plan)
-            url = export_and_upload(audio, difficulty, length_min, pace)
-
-            update_db_job(job_id, {"status": "done", "file_url": url})
-
-        except Exception as e:
-            update_db_job(job_id, {"status": "error", "error": str(e)})
-
-        time.sleep(0.1)
-
-
-# start background worker thread
-threading.Thread(target=worker_loop, daemon=True).start()
-
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
-
-def get_user_id_from_bearer():
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+        return json.loads(payload)
+    except Exception:
+        return {}
+
+def get_bearer_token() -> str | None:
     auth = request.headers.get("Authorization") or ""
     if not auth.lower().startswith("bearer "):
         return None
-
     token = auth.split(" ", 1)[1].strip()
+    return token or None
+
+def get_user_id_from_bearer_fast() -> str | None:
+    """
+    Fast local validation (no network call) using SUPABASE_JWT_SECRET.
+    Returns Supabase user_id (sub) or None.
+    """
+    token = get_bearer_token()
     if not token:
         return None
 
-    # If you forgot to set the env var, fail closed
     if not SUPABASE_JWT_SECRET:
+        # Fail closed: if you didn't set the secret, treat as unauthorized
         return None
 
     try:
+        import jwt  # PyJWT
         payload = jwt.decode(
             token,
             SUPABASE_JWT_SECRET,
             algorithms=["HS256"],
             options={"verify_aud": False},
         )
-        return payload.get("sub")  # Supabase user id
+        return payload.get("sub")
     except Exception:
         return None
+
+def safe_job_response(job: dict, is_public: bool):
+    """
+    Only return the minimal fields frontend needs.
+    (Avoid returning plan, storage_path, etc.)
+    """
+    return {
+        "job_id": job.get("id"),
+        "status": job.get("status"),
+        "file_url": job.get("file_url"),
+        "error": job.get("error"),
+        "is_public": bool(is_public),
+    }
 
 # -------------------------------------------------
 # Routes
@@ -368,21 +101,23 @@ def get_user_id_from_bearer():
 
 @app.route("/")
 def home():
-    return "Corner Backend Running"
-
+    return "Corner Backend OK"
 
 @app.route("/generate", methods=["POST"])
 def deprecated_generate():
     # Frontend should NOT call this anymore.
     return jsonify({
         "status": "error",
-        "error": "This backend no longer handles /generate. Use the Corner API service.",
+        "error": "This service does not handle /generate. Use the Corner API service.",
     }), 400
 
-@app.route("/job-status/<job_id>")
+@app.route("/job-status/<job_id>", methods=["GET"])
 def job_status(job_id):
+    """
+    Public jobs: readable by anyone.
+    Private jobs: require Bearer JWT and must match jobs.user_id.
+    """
     try:
-        # Fetch job row
         result = (
             supabase.table("jobs")
             .select("id,status,file_url,error,is_public,user_id")
@@ -395,32 +130,21 @@ def job_status(job_id):
             return jsonify({"status": "not_found"}), 404
 
         job = result.data[0]
+        is_public = bool(job.get("is_public"))
 
-        # Public jobs are always readable
-        if job.get("is_public"):
-            return jsonify({
-                "job_id": job["id"],
-                "status": job["status"],
-                "file_url": job["file_url"],
-                "error": job["error"],
-                "is_public": True,
-            }), 200
+        # Public jobs: always readable
+        if is_public:
+            return jsonify(safe_job_response(job, True)), 200
 
-        # Private job → require auth (FAST local JWT verify)
-        uid = get_user_id_from_bearer()
+        # Private jobs: require auth + ownership
+        uid = get_user_id_from_bearer_fast()
         if not uid:
             return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
         if uid != job.get("user_id"):
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
-        return jsonify({
-            "job_id": job["id"],
-            "status": job["status"],
-            "file_url": job["file_url"],
-            "error": job["error"],
-            "is_public": False,
-        }), 200
+        return jsonify(safe_job_response(job, False)), 200
 
     except Exception as e:
         return jsonify({
@@ -431,33 +155,56 @@ def job_status(job_id):
 
 @app.route("/signed-url/<job_id>", methods=["GET"])
 def signed_url(job_id):
-    # 1) Require auth
-    auth = request.headers.get("Authorization") or ""
-    if not auth.lower().startswith("bearer "):
-        return jsonify({"status":"error","error":"Unauthorized"}), 401
+    """
+    Returns a short-lived signed URL for the audio file.
+    Requires auth and ownership (via class_sessions.user_id).
+    """
+    try:
+        uid = get_user_id_from_bearer_fast()
+        if not uid:
+            return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
-    token = auth.split(" ", 1)[1].strip()
-    claims = jwt_claims(token)
-    user_id = claims.get("sub")
-    if not user_id:
-        return jsonify({"status":"error","error":"Unauthorized"}), 401
+        sess = (
+            supabase.table("class_sessions")
+            .select("user_id, storage_path, job_id")
+            .eq("job_id", job_id)
+            .limit(1)
+            .execute()
+        )
 
-    # 2) Find the class session (or job record) and confirm ownership
-    sess = supabase.table("class_sessions").select("user_id, storage_path, job_id").eq("job_id", job_id).limit(1).execute()
-    if not sess.data:
-        return jsonify({"status":"error","error":"Not found"}), 404
+        if not sess.data:
+            return jsonify({"status": "error", "error": "Not found"}), 404
 
-    row = sess.data[0]
-    if row.get("user_id") != user_id:
-        return jsonify({"status":"error","error":"Forbidden"}), 403
+        row = sess.data[0]
+        if row.get("user_id") != uid:
+            return jsonify({"status": "error", "error": "Forbidden"}), 403
 
-    storage_path = row.get("storage_path") or f"classes/{job_id}.mp3"
+        storage_path = row.get("storage_path") or f"classes/{job_id}.mp3"
 
-    # 3) Create a signed URL (expires in 10 minutes)
-    signed = supabase.storage.from_("audio").create_signed_url(storage_path, 60 * 10)
+        signed = supabase.storage.from_("audio").create_signed_url(storage_path, 60 * 10)
 
-    # supabase-py returns dict-like
-    if not signed or not signed.get("signedURL"):
-        return jsonify({"status":"error","error":"Could not sign url","details": signed}), 500
+        # supabase-py returns dict-like
+        if not signed or not signed.get("signedURL"):
+            return jsonify({"status": "error", "error": "Could not sign url", "details": signed}), 500
 
-    return jsonify({"status":"ok","url": signed["signedURL"]})
+        return jsonify({"status": "ok", "url": signed["signedURL"]}), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Internal server error",
+            "details": str(e),
+        }), 500
+
+# Optional quick sanity endpoint (keeps you from re-opening the idna rabbit hole)
+@app.route("/_health")
+def _health():
+    return jsonify({
+        "ok": True,
+        "supabase_url_set": bool(SUPABASE_URL),
+        "service_key_set": bool(SUPABASE_SERVICE_KEY),
+        "jwt_secret_set": bool(SUPABASE_JWT_SECRET),
+    }), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)

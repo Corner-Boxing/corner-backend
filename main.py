@@ -119,7 +119,7 @@ def job_status(job_id):
         # 1) Fetch job from jobs table (ONLY columns that actually exist)
         job_res = (
             supabase.table("jobs")
-            .select("id,status,file_url,error")
+            .select("id,status,file_url,error,storage_path")
             .eq("id", job_id)
             .limit(1)
             .execute()
@@ -148,9 +148,17 @@ def job_status(job_id):
         is_public = bool(sess.get("is_public"))
         owner_id = sess.get("user_id")  # may be null for guests
 
-        # 3) Public sessions are always readable
+        # 3) Public sessions are always readable.
+        # If the job is done and we have storage_path, return a signed URL (bucket is private).
         if is_public:
+            if (job.get("status") == "done") and (job.get("storage_path") or ""):
+                signed = supabase.storage.from_("audio").create_signed_url(job["storage_path"], 60 * 10)
+                url = _extract_signed_url(signed)
+                if url:
+                    job = dict(job)
+                    job["file_url"] = url
             return jsonify(safe_job_response(job, True)), 200
+
 
         # 4) Private session -> require auth and ownership
         uid = get_user_id_from_bearer_fast()
@@ -160,7 +168,16 @@ def job_status(job_id):
         if not owner_id or uid != owner_id:
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
+        # Owner can read; if done, attach a signed URL
+        if (job.get("status") == "done") and (job.get("storage_path") or ""):
+            signed = supabase.storage.from_("audio").create_signed_url(job["storage_path"], 60 * 10)
+            url = _extract_signed_url(signed)
+            if url:
+                job = dict(job)
+                job["file_url"] = url
+
         return jsonify(safe_job_response(job, False)), 200
+
 
     except Exception as e:
         return jsonify({
@@ -198,11 +215,13 @@ def signed_url(job_id):
         storage_path = row.get("storage_path") or f"classes/{job_id}.mp3"
 
         signed = supabase.storage.from_("audio").create_signed_url(storage_path, 60 * 10)
+        url = _extract_signed_url(signed)
 
-        if not signed or not signed.get("signedURL"):
+        if not url:
             return jsonify({"status": "error", "error": "Could not sign url", "details": signed}), 500
 
-        return jsonify({"status": "ok", "url": signed["signedURL"]}), 200
+        return jsonify({"status": "ok", "url": url}), 200
+
 
     except Exception as e:
         return jsonify({

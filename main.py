@@ -65,13 +65,14 @@ def get_user_id_from_bearer_fast() -> str | None:
     except Exception:
         return None
 
-def safe_job_response(job: dict, is_public: bool):
+def safe_job_response(job: dict, is_public: bool, class_mode: str | None = None):
     return {
         "job_id": job.get("id"),
         "status": job.get("status"),
         "file_url": job.get("file_url"),
         "error": job.get("error"),
         "is_public": bool(is_public),
+        "class_mode": class_mode or None,
     }
 
 def _extract_signed_url(resp: dict | None) -> str | None:
@@ -133,7 +134,7 @@ def job_status(job_id):
         # 2) Fetch session visibility + owner from class_sessions
         sess_res = (
             supabase.table("class_sessions")
-            .select("is_public,user_id")
+            .select("is_public,user_id,class_mode")
             .eq("job_id", job_id)
             .limit(1)
             .execute()
@@ -143,10 +144,11 @@ def job_status(job_id):
         # If there's no class_sessions row (edge case), default to public READ of status only.
         # (This avoids breaking older jobs and prevents 500 spam.)
         if not sess:
-            return jsonify(safe_job_response(job, True)), 200
+            return jsonify(safe_job_response(job, True, class_mode)), 200
 
         is_public = bool(sess.get("is_public"))
         owner_id = sess.get("user_id")  # may be null for guests
+        class_mode = sess.get("class_mode")
 
         # 3) Public sessions are always readable.
         # If the job is done and we have storage_path, return a signed URL (bucket is private).
@@ -157,7 +159,7 @@ def job_status(job_id):
                 if url:
                     job = dict(job)
                     job["file_url"] = url
-            return jsonify(safe_job_response(job, True)), 200
+            return jsonify(safe_job_response(job, True, class_mode)), 200
 
 
         # 4) Private session -> require auth and ownership
@@ -176,7 +178,7 @@ def job_status(job_id):
                 job = dict(job)
                 job["file_url"] = url
 
-        return jsonify(safe_job_response(job, False)), 200
+        return jsonify(safe_job_response(job, False, class_mode)), 200
 
 
     except Exception as e:

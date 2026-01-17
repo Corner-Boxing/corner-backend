@@ -74,6 +74,21 @@ def safe_job_response(job: dict, is_public: bool):
         "is_public": bool(is_public),
     }
 
+def _extract_signed_url(resp: dict | None) -> str | None:
+    if not resp:
+        return None
+    # Supabase libs sometimes return different key casing
+    for k in ("signedURL", "signedUrl", "signed_url"):
+        if isinstance(resp.get(k), str) and resp.get(k):
+            return resp[k]
+    data = resp.get("data")
+    if isinstance(data, dict):
+        for k in ("signedURL", "signedUrl", "signed_url"):
+            if isinstance(data.get(k), str) and data.get(k):
+                return data[k]
+    return None
+
+
 # -------------------------------------------------
 # Routes
 # -------------------------------------------------

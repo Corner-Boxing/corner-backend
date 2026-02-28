@@ -140,6 +140,7 @@ def job_status(job_id):
             .execute()
         )
         sess = sess_res.data[0] if sess_res.data else None
+        class_mode = None  # <-- add this line
 
         # If there's no class_sessions row (edge case), default to public READ of status only.
         # (This avoids breaking older jobs and prevents 500 spam.)

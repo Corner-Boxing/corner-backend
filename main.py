@@ -217,7 +217,20 @@ def signed_url(job_id):
         if row.get("user_id") != uid:
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
-        storage_path = row.get("storage_path") or f"classes/{job_id}.mp3"
+        storage_path = row.get("storage_path")
+
+        if not storage_path:
+            job_res = (
+                supabase.table("jobs")
+                .select("storage_path")
+                .eq("id", job_id)
+                .limit(1)
+                .execute()
+            )
+            if job_res.data:
+                storage_path = job_res.data[0].get("storage_path")
+
+        storage_path = storage_path or f"classes/{job_id}.mp3"
 
         signed = supabase.storage.from_("audio").create_signed_url(storage_path, 60 * 10)
         url = _extract_signed_url(signed)

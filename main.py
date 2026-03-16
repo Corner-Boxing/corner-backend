@@ -109,15 +109,13 @@ def deprecated_generate():
 def job_status(job_id):
     """
     Source of truth:
-      - jobs: status/file_url/error
-      - class_sessions: is_public + user_id (ownership)
+      - jobs: status/file_url/error/storage_path
+      - class_sessions: visibility/ownership/class_mode/storage_path fallback
 
     Public sessions -> readable by anyone.
     Private sessions -> require Bearer JWT and must match class_sessions.user_id.
-    Guest sessions with is_public=false will be 401 (expected until you flip them to public).
     """
     try:
-        # 1) Fetch job from jobs table (ONLY columns that actually exist)
         job_res = (
             supabase.table("jobs")
             .select("id,status,file_url,error,storage_path")
@@ -129,41 +127,53 @@ def job_status(job_id):
         if not job_res.data:
             return jsonify({"status": "not_found"}), 404
 
-        job = job_res.data[0]
+        job = dict(job_res.data[0])
 
-        # 2) Fetch session visibility + owner from class_sessions
         sess_res = (
             supabase.table("class_sessions")
-            .select("is_public,user_id,class_mode")
+            .select("is_public,user_id,class_mode,storage_path,file_url,status,error")
             .eq("job_id", job_id)
             .limit(1)
             .execute()
         )
         sess = sess_res.data[0] if sess_res.data else None
-        class_mode = None  # <-- add this line
 
-        # If there's no class_sessions row (edge case), default to public READ of status only.
-        # (This avoids breaking older jobs and prevents 500 spam.)
+        class_mode = None
+
         if not sess:
             return jsonify(safe_job_response(job, True, class_mode)), 200
 
         is_public = bool(sess.get("is_public"))
-        owner_id = sess.get("user_id")  # may be null for guests
+        owner_id = sess.get("user_id")
         class_mode = sess.get("class_mode")
 
-        # 3) Public sessions are always readable.
-        # If the job is done and we have storage_path, return a signed URL (bucket is private).
-        if is_public:
-            if (job.get("status") == "done") and (job.get("storage_path") or ""):
-                signed = supabase.storage.from_("audio").create_signed_url(job["storage_path"], 60 * 10)
+        # Fallbacks from class_sessions if jobs row is missing fields
+        effective_status = job.get("status") or sess.get("status")
+        effective_error = job.get("error") or sess.get("error")
+        effective_file_url = job.get("file_url") or sess.get("file_url")
+        effective_storage_path = job.get("storage_path") or sess.get("storage_path")
+
+        effective_job = {
+            "id": job.get("id"),
+            "status": effective_status,
+            "error": effective_error,
+            "file_url": effective_file_url,
+            "storage_path": effective_storage_path,
+        }
+
+        def attach_signed_url_if_ready(row: dict) -> dict:
+            if row.get("status") == "done" and (row.get("storage_path") or ""):
+                signed = supabase.storage.from_("audio").create_signed_url(row["storage_path"], 60 * 10)
                 url = _extract_signed_url(signed)
                 if url:
-                    job = dict(job)
-                    job["file_url"] = url
-            return jsonify(safe_job_response(job, True, class_mode)), 200
+                    row = dict(row)
+                    row["file_url"] = url
+            return row
 
+        if is_public:
+            effective_job = attach_signed_url_if_ready(effective_job)
+            return jsonify(safe_job_response(effective_job, True, class_mode)), 200
 
-        # 4) Private session -> require auth and ownership
         uid = get_user_id_from_bearer_fast()
         if not uid:
             return jsonify({"status": "error", "error": "Unauthorized"}), 401
@@ -171,16 +181,8 @@ def job_status(job_id):
         if not owner_id or uid != owner_id:
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
-        # Owner can read; if done, attach a signed URL
-        if (job.get("status") == "done") and (job.get("storage_path") or ""):
-            signed = supabase.storage.from_("audio").create_signed_url(job["storage_path"], 60 * 10)
-            url = _extract_signed_url(signed)
-            if url:
-                job = dict(job)
-                job["file_url"] = url
-
-        return jsonify(safe_job_response(job, False, class_mode)), 200
-
+        effective_job = attach_signed_url_if_ready(effective_job)
+        return jsonify(safe_job_response(effective_job, False, class_mode)), 200
 
     except Exception as e:
         return jsonify({

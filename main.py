@@ -68,18 +68,66 @@ def get_user_id_from_bearer_fast() -> str | None:
     except Exception:
         return None
 
-def _extract_signed_url(resp: dict | None) -> str | None:
+def _extract_signed_url(resp) -> str | None:
+    """
+    Be tolerant of supabase-py response shape differences.
+    Supports:
+    - plain dicts
+    - nested dicts under .data / ["data"]
+    - response objects with attributes
+    - pydantic-ish objects with model_dump()
+    """
     if not resp:
         return None
-    # Supabase libs sometimes return different key casing
-    for k in ("signedURL", "signedUrl", "signed_url"):
-        if isinstance(resp.get(k), str) and resp.get(k):
-            return resp[k]
-    data = resp.get("data")
-    if isinstance(data, dict):
-        for k in ("signedURL", "signedUrl", "signed_url"):
-            if isinstance(data.get(k), str) and data.get(k):
-                return data[k]
+
+    # Direct string case
+    if isinstance(resp, str) and resp.strip():
+        return resp.strip()
+
+    candidates = []
+
+    # Dict-shaped response
+    if isinstance(resp, dict):
+        candidates.append(resp)
+        data = resp.get("data")
+        if isinstance(data, dict):
+            candidates.append(data)
+
+    # Object-shaped response
+    else:
+        candidates.append(resp)
+
+        data_attr = getattr(resp, "data", None)
+        if data_attr is not None:
+            candidates.append(data_attr)
+
+        model_dump = getattr(resp, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+                if isinstance(dumped, dict):
+                    candidates.append(dumped)
+                    dumped_data = dumped.get("data")
+                    if dumped_data is not None:
+                        candidates.append(dumped_data)
+            except Exception:
+                pass
+
+    for obj in candidates:
+        if obj is None:
+            continue
+
+        for key in ("signedURL", "signedUrl", "signed_url", "url"):
+            value = None
+
+            if isinstance(obj, dict):
+                value = obj.get(key)
+            else:
+                value = getattr(obj, key, None)
+
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
     return None
 
 def safe_job_response(
@@ -100,7 +148,7 @@ def safe_job_response(
 
 def _sign_storage_path(storage_path: str, ttl_seconds: int = 60 * 10) -> tuple[str | None, dict | None, str | None]:
     """
-    Returns: (url, raw_response, error_string)
+    Returns: (url, raw_response_dict_or_repr, error_string)
     Never raises.
     """
     if not storage_path:
@@ -109,11 +157,28 @@ def _sign_storage_path(storage_path: str, ttl_seconds: int = 60 * 10) -> tuple[s
     try:
         raw = supabase.storage.from_("audio").create_signed_url(storage_path, ttl_seconds)
         url = _extract_signed_url(raw)
+
+        raw_debug = None
+        if isinstance(raw, dict):
+            raw_debug = raw
+        else:
+            try:
+                model_dump = getattr(raw, "model_dump", None)
+                if callable(model_dump):
+                    dumped = model_dump()
+                    raw_debug = dumped if isinstance(dumped, dict) else {"repr": repr(raw)}
+                else:
+                    raw_debug = {"repr": repr(raw), "type": type(raw).__name__}
+            except Exception:
+                raw_debug = {"repr": repr(raw), "type": type(raw).__name__}
+
         if url:
-            return url, raw, None
-        return None, raw, "signed_url_missing_in_response"
+            return url, raw_debug, None
+
+        return None, raw_debug, "signed_url_missing_in_response"
+
     except Exception as e:
-        return None, None, str(e)
+        return None, {"exception_type": type(e).__name__}, str(e)
 
 def _build_effective_job(job: dict, sess: dict | None) -> dict:
     if not sess:

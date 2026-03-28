@@ -2,7 +2,7 @@ import os
 import base64
 import json
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from supabase import create_client, Client
 
@@ -180,6 +180,37 @@ def _sign_storage_path(storage_path: str, ttl_seconds: int = 60 * 10) -> tuple[s
     except Exception as e:
         return None, {"exception_type": type(e).__name__}, str(e)
 
+def _download_storage_object(storage_path: str) -> tuple[bytes | None, str | None]:
+    """
+    Download raw bytes from Supabase Storage using the service role client.
+    Returns (bytes, error_string).
+    """
+    if not storage_path:
+        return None, "missing_storage_path"
+
+    try:
+        data = supabase.storage.from_("audio").download(storage_path)
+
+        # supabase-py versions differ:
+        # sometimes bytes, sometimes a response-like object with .content or .read()
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data), None
+
+        content = getattr(data, "content", None)
+        if isinstance(content, (bytes, bytearray)):
+            return bytes(content), None
+
+        read_fn = getattr(data, "read", None)
+        if callable(read_fn):
+            out = read_fn()
+            if isinstance(out, (bytes, bytearray)):
+                return bytes(out), None
+
+        return None, f"unexpected_download_shape:{type(data).__name__}"
+
+    except Exception as e:
+        return None, str(e)
+
 def _build_effective_job(job: dict, sess: dict | None) -> dict:
     if not sess:
         return {
@@ -290,18 +321,11 @@ def job_status(job_id):
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
         signed_url = None
+        proxy_url = None
         if effective_job.get("status") == "done" and effective_job.get("storage_path"):
-            signed_url, raw_signed, sign_err = _sign_storage_path(effective_job["storage_path"])
-            if sign_err:
-                logger.warning(
-                    "[job-status] private sign failed job_id=%s storage_path=%s err=%s raw=%s",
-                    job_id,
-                    effective_job.get("storage_path"),
-                    sign_err,
-                    raw_signed,
-                )
+            proxy_url = f"{request.host_url.rstrip('/')}/download/{job_id}"
 
-        return jsonify(safe_job_response(effective_job, False, class_mode, signed_url=signed_url)), 200
+        return jsonify(safe_job_response(effective_job, False, class_mode, signed_url=proxy_url)), 200
 
     except Exception as e:
         logger.exception("[job-status] fatal job_id=%s", job_id)
@@ -382,34 +406,110 @@ def signed_url(job_id):
                 storage_path,
             )
 
-        url, raw_signed, sign_err = _sign_storage_path(storage_path, 60 * 10)
-
-        if sign_err:
-            logger.warning(
-                "[signed-url] sign failed job_id=%s storage_path=%s err=%s raw=%s",
-                job_id,
-                storage_path,
-                sign_err,
-                raw_signed,
-            )
-            return jsonify({
-                "status": "error",
-                "error": "could_not_sign_url",
-                "job_id": job_id,
-                "storage_path": storage_path,
-                "details": sign_err,
-                "raw": raw_signed,
-            }), 500
+        proxy_url = f"{request.host_url.rstrip('/')}/download/{job_id}"
 
         return jsonify({
             "status": "ok",
-            "url": url,
+            "url": proxy_url,
             "job_id": job_id,
             "storage_path": storage_path,
+            "source": "backend_proxy",
         }), 200
 
     except Exception as e:
         logger.exception("[signed-url] fatal job_id=%s", job_id)
+        return jsonify({
+            "status": "error",
+            "error": "Internal server error",
+            "details": str(e),
+        }), 500
+
+@app.route("/download/<job_id>", methods=["GET"])
+def download_job_audio(job_id):
+    """
+    Private authenticated audio proxy.
+    This bypasses signed URL generation entirely.
+    """
+    try:
+        uid = get_user_id_from_bearer_fast()
+        if not uid:
+            return jsonify({"status": "error", "error": "Unauthorized"}), 401
+
+        sess_res = (
+            supabase.table("class_sessions")
+            .select("user_id, storage_path, job_id, status, file_url")
+            .eq("job_id", job_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not sess_res.data:
+            return jsonify({"status": "error", "error": "Not found"}), 404
+
+        sess = sess_res.data[0]
+
+        if sess.get("user_id") != uid:
+            return jsonify({"status": "error", "error": "Forbidden"}), 403
+
+        storage_path = sess.get("storage_path")
+        session_status = sess.get("status")
+
+        if not storage_path:
+            job_res = (
+                supabase.table("jobs")
+                .select("storage_path,status")
+                .eq("id", job_id)
+                .limit(1)
+                .execute()
+            )
+            if job_res.data:
+                job_row = job_res.data[0]
+                storage_path = job_row.get("storage_path")
+                session_status = session_status or job_row.get("status")
+
+        logger.info(
+            "[download] job_id=%s uid=%s status=%s storage_path=%s",
+            job_id,
+            uid,
+            session_status,
+            storage_path,
+        )
+
+        if not storage_path:
+            return jsonify({
+                "status": "error",
+                "error": "storage_path_missing",
+                "job_id": job_id,
+            }), 409
+
+        blob, dl_err = _download_storage_object(storage_path)
+        if dl_err or not blob:
+            logger.warning(
+                "[download] download failed job_id=%s storage_path=%s err=%s",
+                job_id,
+                storage_path,
+                dl_err,
+            )
+            return jsonify({
+                "status": "error",
+                "error": "could_not_download_audio",
+                "job_id": job_id,
+                "storage_path": storage_path,
+                "details": dl_err,
+            }), 500
+
+        return Response(
+            blob,
+            status=200,
+            mimetype="audio/mpeg",
+            headers={
+                "Content-Disposition": f'inline; filename="{job_id}.mp3"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    except Exception as e:
+        logger.exception("[download] fatal job_id=%s", job_id)
         return jsonify({
             "status": "error",
             "error": "Internal server error",

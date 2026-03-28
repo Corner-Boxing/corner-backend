@@ -277,7 +277,7 @@ def signed_url(job_id):
         session_status = sess.get("status")
         existing_file_url = sess.get("file_url")
 
-        if not storage_path:
+        if not storage_path or not session_status or not existing_file_url:
             job_res = (
                 supabase.table("jobs")
                 .select("storage_path,status,file_url")
@@ -287,7 +287,7 @@ def signed_url(job_id):
             )
             if job_res.data:
                 job_row = job_res.data[0]
-                storage_path = job_row.get("storage_path")
+                storage_path = storage_path or job_row.get("storage_path")
                 session_status = session_status or job_row.get("status")
                 existing_file_url = existing_file_url or job_row.get("file_url")
 
@@ -301,14 +301,21 @@ def signed_url(job_id):
         )
 
         if existing_file_url:
-            return jsonify({"status": "ok", "url": existing_file_url, "source": "existing_file_url"}), 200
-
-        if not storage_path:
             return jsonify({
-                "status": "error",
-                "error": "storage_path_missing",
-                "job_id": job_id,
-            }), 409
+                "status": "ok",
+                "url": existing_file_url,
+                "source": "existing_file_url"
+            }), 200
+
+        # deterministic fallback:
+        # worker always uploads to classes/{job_id}.mp3
+        if not storage_path:
+            storage_path = f"classes/{job_id}.mp3"
+            logger.warning(
+                "[signed-url] storage_path missing in DB, falling back to deterministic path for job_id=%s path=%s",
+                job_id,
+                storage_path,
+            )
 
         url, raw_signed, sign_err = _sign_storage_path(storage_path, 60 * 10)
 

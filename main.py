@@ -1,6 +1,7 @@
 import os
 import base64
 import json
+import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
@@ -10,6 +11,8 @@ from supabase import create_client, Client
 # -------------------------------------------------
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("corner-backend")
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
@@ -65,16 +68,6 @@ def get_user_id_from_bearer_fast() -> str | None:
     except Exception:
         return None
 
-def safe_job_response(job: dict, is_public: bool, class_mode: str | None = None):
-    return {
-        "job_id": job.get("id"),
-        "status": job.get("status"),
-        "file_url": job.get("file_url"),
-        "error": job.get("error"),
-        "is_public": bool(is_public),
-        "class_mode": class_mode or None,
-    }
-
 def _extract_signed_url(resp: dict | None) -> str | None:
     if not resp:
         return None
@@ -89,6 +82,56 @@ def _extract_signed_url(resp: dict | None) -> str | None:
                 return data[k]
     return None
 
+def safe_job_response(
+    job: dict,
+    is_public: bool,
+    class_mode: str | None = None,
+    signed_url: str | None = None,
+):
+    return {
+        "job_id": job.get("id"),
+        "status": job.get("status"),
+        "file_url": signed_url or job.get("file_url"),
+        "error": job.get("error"),
+        "is_public": bool(is_public),
+        "class_mode": class_mode or None,
+        "storage_path": job.get("storage_path"),
+    }
+
+def _sign_storage_path(storage_path: str, ttl_seconds: int = 60 * 10) -> tuple[str | None, dict | None, str | None]:
+    """
+    Returns: (url, raw_response, error_string)
+    Never raises.
+    """
+    if not storage_path:
+        return None, None, "missing_storage_path"
+
+    try:
+        raw = supabase.storage.from_("audio").create_signed_url(storage_path, ttl_seconds)
+        url = _extract_signed_url(raw)
+        if url:
+            return url, raw, None
+        return None, raw, "signed_url_missing_in_response"
+    except Exception as e:
+        return None, None, str(e)
+
+def _build_effective_job(job: dict, sess: dict | None) -> dict:
+    if not sess:
+        return {
+            "id": job.get("id"),
+            "status": job.get("status"),
+            "error": job.get("error"),
+            "file_url": job.get("file_url"),
+            "storage_path": job.get("storage_path"),
+        }
+
+    return {
+        "id": job.get("id"),
+        "status": job.get("status") or sess.get("status"),
+        "error": job.get("error") or sess.get("error"),
+        "file_url": job.get("file_url") or sess.get("file_url"),
+        "storage_path": job.get("storage_path") or sess.get("storage_path"),
+    }
 
 # -------------------------------------------------
 # Routes
@@ -138,42 +181,42 @@ def job_status(job_id):
         )
         sess = sess_res.data[0] if sess_res.data else None
 
-        class_mode = None
+        class_mode = sess.get("class_mode") if sess else None
+        is_public = bool(sess.get("is_public")) if sess else True
+        owner_id = sess.get("user_id") if sess else None
 
+        effective_job = _build_effective_job(job, sess)
+
+        logger.info(
+            "[job-status] job_id=%s status=%s storage_path=%s file_url_present=%s is_public=%s owner_id=%s",
+            job_id,
+            effective_job.get("status"),
+            effective_job.get("storage_path"),
+            bool(effective_job.get("file_url")),
+            is_public,
+            owner_id,
+        )
+
+        # No session row? Just return the job row as effectively public/debuggable.
         if not sess:
-            return jsonify(safe_job_response(job, True, class_mode)), 200
-
-        is_public = bool(sess.get("is_public"))
-        owner_id = sess.get("user_id")
-        class_mode = sess.get("class_mode")
-
-        # Fallbacks from class_sessions if jobs row is missing fields
-        effective_status = job.get("status") or sess.get("status")
-        effective_error = job.get("error") or sess.get("error")
-        effective_file_url = job.get("file_url") or sess.get("file_url")
-        effective_storage_path = job.get("storage_path") or sess.get("storage_path")
-
-        effective_job = {
-            "id": job.get("id"),
-            "status": effective_status,
-            "error": effective_error,
-            "file_url": effective_file_url,
-            "storage_path": effective_storage_path,
-        }
-
-        def attach_signed_url_if_ready(row: dict) -> dict:
-            if row.get("status") == "done" and (row.get("storage_path") or ""):
-                signed = supabase.storage.from_("audio").create_signed_url(row["storage_path"], 60 * 10)
-                url = _extract_signed_url(signed)
-                if url:
-                    row = dict(row)
-                    row["file_url"] = url
-            return row
-
-        if is_public:
-            effective_job = attach_signed_url_if_ready(effective_job)
             return jsonify(safe_job_response(effective_job, True, class_mode)), 200
 
+        # Public session
+        if is_public:
+            signed_url = None
+            if effective_job.get("status") == "done" and effective_job.get("storage_path"):
+                signed_url, raw_signed, sign_err = _sign_storage_path(effective_job["storage_path"])
+                if sign_err:
+                    logger.warning(
+                        "[job-status] public sign failed job_id=%s storage_path=%s err=%s raw=%s",
+                        job_id,
+                        effective_job.get("storage_path"),
+                        sign_err,
+                        raw_signed,
+                    )
+            return jsonify(safe_job_response(effective_job, True, class_mode, signed_url=signed_url)), 200
+
+        # Private session: require auth + ownership
         uid = get_user_id_from_bearer_fast()
         if not uid:
             return jsonify({"status": "error", "error": "Unauthorized"}), 401
@@ -181,10 +224,22 @@ def job_status(job_id):
         if not owner_id or uid != owner_id:
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
-        effective_job = attach_signed_url_if_ready(effective_job)
-        return jsonify(safe_job_response(effective_job, False, class_mode)), 200
+        signed_url = None
+        if effective_job.get("status") == "done" and effective_job.get("storage_path"):
+            signed_url, raw_signed, sign_err = _sign_storage_path(effective_job["storage_path"])
+            if sign_err:
+                logger.warning(
+                    "[job-status] private sign failed job_id=%s storage_path=%s err=%s raw=%s",
+                    job_id,
+                    effective_job.get("storage_path"),
+                    sign_err,
+                    raw_signed,
+                )
+
+        return jsonify(safe_job_response(effective_job, False, class_mode, signed_url=signed_url)), 200
 
     except Exception as e:
+        logger.exception("[job-status] fatal job_id=%s", job_id)
         return jsonify({
             "status": "error",
             "error": "Internal server error",
@@ -202,46 +257,87 @@ def signed_url(job_id):
         if not uid:
             return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
-        sess = (
+        sess_res = (
             supabase.table("class_sessions")
-            .select("user_id, storage_path, job_id")
+            .select("user_id, storage_path, job_id, status, file_url")
             .eq("job_id", job_id)
             .limit(1)
             .execute()
         )
 
-        if not sess.data:
+        if not sess_res.data:
             return jsonify({"status": "error", "error": "Not found"}), 404
 
-        row = sess.data[0]
-        if row.get("user_id") != uid:
+        sess = sess_res.data[0]
+
+        if sess.get("user_id") != uid:
             return jsonify({"status": "error", "error": "Forbidden"}), 403
 
-        storage_path = row.get("storage_path")
+        storage_path = sess.get("storage_path")
+        session_status = sess.get("status")
+        existing_file_url = sess.get("file_url")
 
         if not storage_path:
             job_res = (
                 supabase.table("jobs")
-                .select("storage_path")
+                .select("storage_path,status,file_url")
                 .eq("id", job_id)
                 .limit(1)
                 .execute()
             )
             if job_res.data:
-                storage_path = job_res.data[0].get("storage_path")
+                job_row = job_res.data[0]
+                storage_path = job_row.get("storage_path")
+                session_status = session_status or job_row.get("status")
+                existing_file_url = existing_file_url or job_row.get("file_url")
 
-        storage_path = storage_path or f"classes/{job_id}.mp3"
+        logger.info(
+            "[signed-url] job_id=%s uid=%s status=%s storage_path=%s existing_file_url_present=%s",
+            job_id,
+            uid,
+            session_status,
+            storage_path,
+            bool(existing_file_url),
+        )
 
-        signed = supabase.storage.from_("audio").create_signed_url(storage_path, 60 * 10)
-        url = _extract_signed_url(signed)
+        if existing_file_url:
+            return jsonify({"status": "ok", "url": existing_file_url, "source": "existing_file_url"}), 200
 
-        if not url:
-            return jsonify({"status": "error", "error": "Could not sign url", "details": signed}), 500
+        if not storage_path:
+            return jsonify({
+                "status": "error",
+                "error": "storage_path_missing",
+                "job_id": job_id,
+            }), 409
 
-        return jsonify({"status": "ok", "url": url}), 200
+        url, raw_signed, sign_err = _sign_storage_path(storage_path, 60 * 10)
 
+        if sign_err:
+            logger.warning(
+                "[signed-url] sign failed job_id=%s storage_path=%s err=%s raw=%s",
+                job_id,
+                storage_path,
+                sign_err,
+                raw_signed,
+            )
+            return jsonify({
+                "status": "error",
+                "error": "could_not_sign_url",
+                "job_id": job_id,
+                "storage_path": storage_path,
+                "details": sign_err,
+                "raw": raw_signed,
+            }), 500
+
+        return jsonify({
+            "status": "ok",
+            "url": url,
+            "job_id": job_id,
+            "storage_path": storage_path,
+        }), 200
 
     except Exception as e:
+        logger.exception("[signed-url] fatal job_id=%s", job_id)
         return jsonify({
             "status": "error",
             "error": "Internal server error",
@@ -256,6 +352,33 @@ def _health():
         "service_key_set": bool(SUPABASE_SERVICE_KEY),
         "jwt_secret_set": bool(SUPABASE_JWT_SECRET),
     }), 200
+
+@app.route("/debug-job/<job_id>", methods=["GET"])
+def debug_job(job_id):
+    try:
+        job_res = (
+            supabase.table("jobs")
+            .select("id,status,file_url,error,storage_path,updated_at,created_at")
+            .eq("id", job_id)
+            .limit(1)
+            .execute()
+        )
+
+        sess_res = (
+            supabase.table("class_sessions")
+            .select("id,job_id,user_id,is_public,class_mode,status,file_url,error,storage_path,created_at,completed_at")
+            .eq("job_id", job_id)
+            .limit(1)
+            .execute()
+        )
+
+        return jsonify({
+            "job": job_res.data[0] if job_res.data else None,
+            "class_session": sess_res.data[0] if sess_res.data else None,
+        }), 200
+    except Exception as e:
+        logger.exception("[debug-job] fatal job_id=%s", job_id)
+        return jsonify({"status": "error", "details": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

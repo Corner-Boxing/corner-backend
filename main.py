@@ -399,20 +399,30 @@ def signed_url(job_id):
 @app.route("/download/<job_id>", methods=["GET"])
 def download_audio(job_id):
     """
-    Authenticated backend proxy for private audio files.
-    Streams the MP3 from Supabase storage.
+    Backend proxy for audio files.
+
+    Public demo sessions:
+      - no auth required
+
+    Private full sessions:
+      - require Bearer auth
+      - user must own the class_session
     """
     try:
-        uid = get_user_id_from_bearer_fast()
-        if not uid:
-            return jsonify({"status": "error", "error": "Unauthorized"}), 401
-
         sess = fetch_session_row(job_id)
         if not sess:
             return jsonify({"status": "error", "error": "Not found"}), 404
 
-        if sess.get("user_id") != uid:
-            return jsonify({"status": "error", "error": "Forbidden"}), 403
+        is_public = bool(sess.get("is_public"))
+        owner_id = sess.get("user_id")
+
+        if not is_public:
+            uid = get_user_id_from_bearer_fast()
+            if not uid:
+                return jsonify({"status": "error", "error": "Unauthorized"}), 401
+
+            if not owner_id or uid != owner_id:
+                return jsonify({"status": "error", "error": "Forbidden"}), 403
 
         storage_path = sess.get("storage_path")
         if not storage_path:
@@ -442,6 +452,7 @@ def download_audio(job_id):
             headers={
                 "Content-Disposition": f'inline; filename="{filename}"',
                 "Cache-Control": "no-store",
+                "Accept-Ranges": "bytes",
             },
         )
 

@@ -328,20 +328,28 @@ def job_status(job_id):
 @app.route("/signed-url/<job_id>", methods=["GET"])
 def signed_url(job_id):
     """
-    Returns a stable backend proxy URL instead of asking Supabase to sign on demand.
-    Requires auth + ownership.
+    Returns:
+    - url: stable backend proxy URL
+    - playback_url: direct signed Supabase Storage URL for mobile/background audio playback
+
+    The frontend should use playback_url as the <audio> src when available.
     """
     try:
         uid = get_user_id_from_bearer_fast()
-        if not uid:
-            return jsonify({"status": "error", "error": "Unauthorized"}), 401
 
         sess = fetch_session_row(job_id)
         if not sess:
             return jsonify({"status": "error", "error": "Not found"}), 404
 
-        if sess.get("user_id") != uid:
-            return jsonify({"status": "error", "error": "Forbidden"}), 403
+        is_public = bool(sess.get("is_public"))
+        owner_id = sess.get("user_id")
+
+        if not is_public:
+            if not uid:
+                return jsonify({"status": "error", "error": "Unauthorized"}), 401
+
+            if not owner_id or uid != owner_id:
+                return jsonify({"status": "error", "error": "Forbidden"}), 403
 
         storage_path = sess.get("storage_path")
         session_status = sess.get("status")
@@ -355,16 +363,22 @@ def signed_url(job_id):
                 existing_file_url = existing_file_url or job.get("file_url")
 
         logger.info(
-            "[signed-url] job_id=%s uid=%s status=%s storage_path=%s existing_file_url_present=%s",
+            "[signed-url] job_id=%s uid=%s public=%s status=%s storage_path=%s existing_file_url_present=%s",
             job_id,
             uid,
+            is_public,
             session_status,
             storage_path,
             bool(existing_file_url),
         )
 
         if existing_file_url:
-            return jsonify({"status": "ok", "url": existing_file_url, "source": "existing_file_url"}), 200
+            return jsonify({
+                "status": "ok",
+                "url": existing_file_url,
+                "playback_url": existing_file_url,
+                "source": "existing_file_url",
+            }), 200
 
         if not storage_path:
             return jsonify({
@@ -375,11 +389,17 @@ def signed_url(job_id):
 
         proxy_url = f"{request.host_url.rstrip('/')}/download/{job_id}"
 
+        # Long enough for a full class + normal delay before starting.
+        playback_url, raw_debug, sign_error = _sign_storage_path(storage_path, ttl_seconds=60 * 60 * 3)
+
         return jsonify({
             "status": "ok",
             "url": proxy_url,
+            "playback_url": playback_url,
             "job_id": job_id,
             "storage_path": storage_path,
+            "playback_source": "supabase_signed_url" if playback_url else "proxy_fallback",
+            "sign_error": sign_error,
         }), 200
 
     except requests.Timeout:
